@@ -44,25 +44,30 @@ const (
 // to guess.
 const NullToken = `\N`
 
-// PostgreSQL type OIDs whose text rendering can be emitted as a native JSON
-// value rather than a quoted string.
+// Kind is the engine-neutral classification of a column, used to decide how
+// its text value is rendered in JSON. Each driver maps its own type system
+// onto this — PostgreSQL from type OIDs, MySQL from protocol type codes — so
+// this package needs to know nothing about either.
+type Kind uint8
+
 const (
-	oidBool    uint32 = 16
-	oidInt8    uint32 = 20
-	oidInt2    uint32 = 21
-	oidInt4    uint32 = 23
-	oidJSON    uint32 = 114
-	oidFloat4  uint32 = 700
-	oidFloat8  uint32 = 701
-	oidNumeric uint32 = 1700
-	oidJSONB   uint32 = 3802
+	// KindText renders as a JSON string. The safe default: an unrecognised
+	// type is always valid as a string.
+	KindText Kind = iota
+	// KindNumber renders verbatim as a JSON number when the text is a legal
+	// JSON numeric literal, preserving full precision.
+	KindNumber
+	// KindBool renders as JSON true/false.
+	KindBool
+	// KindJSON is embedded as-is when it parses as JSON.
+	KindJSON
 )
 
 // Column describes one result column.
 type Column struct {
 	Name     string
 	TypeName string
-	OID      uint32
+	Kind     Kind
 }
 
 // Row holds one result row in PostgreSQL text format. A nil element is SQL
@@ -234,7 +239,7 @@ func describeColumns(cols []Column) string {
 	for i, c := range cols {
 		t := c.TypeName
 		if t == "" {
-			t = "oid:" + strconv.FormatUint(uint64(c.OID), 10)
+			t = "unknown"
 		}
 		parts[i] = c.Name + ":" + t
 	}
@@ -333,7 +338,7 @@ func encodeJSON(cols []Column, rows []Row) (string, error) {
 			if ci < len(row) {
 				raw = row[ci]
 			}
-			writeJSONValue(&buf, raw, c.OID)
+			writeJSONValue(&buf, raw, c.Kind)
 		}
 		buf.WriteByte('}')
 	}
@@ -348,40 +353,44 @@ func encodeJSON(cols []Column, rows []Row) (string, error) {
 // writeJSONValue maps a text-format value to the most faithful JSON form.
 // Anything it cannot prove is a valid JSON scalar becomes a string, so the
 // output is always valid JSON.
-func writeJSONValue(buf *bytes.Buffer, raw []byte, oid uint32) {
+func writeJSONValue(buf *bytes.Buffer, raw []byte, kind Kind) {
 	if raw == nil {
 		buf.WriteString("null")
 		return
 	}
 	s := string(raw)
 
-	switch oid {
-	case oidBool:
-		// PostgreSQL text format renders booleans as t / f.
+	switch kind {
+	case KindBool:
+		// PostgreSQL renders booleans as t/f in text format; MySQL stores
+		// them as TINYINT(1) and renders 0/1.
 		switch s {
-		case "t", "true":
+		case "t", "true", "TRUE", "1":
 			buf.WriteString("true")
 			return
-		case "f", "false":
+		case "f", "false", "FALSE", "0":
 			buf.WriteString("false")
 			return
 		}
 
-	case oidInt2, oidInt4, oidInt8, oidFloat4, oidFloat8, oidNumeric:
-		// Emitted verbatim so a bigint or a high-precision numeric keeps every
+	case KindNumber:
+		// Emitted verbatim so a bigint or a high-precision decimal keeps every
 		// digit instead of being rounded through a float64. NaN and Infinity
-		// are legal PostgreSQL values but illegal JSON numbers, so they fall
-		// through to the string path below.
+		// are legal PostgreSQL float values but illegal JSON numbers, so they
+		// fall through to the string path below.
 		if isJSONNumber(s) {
 			buf.WriteString(s)
 			return
 		}
 
-	case oidJSON, oidJSONB:
+	case KindJSON:
 		if json.Valid(raw) {
 			buf.Write(raw)
 			return
 		}
+
+	case KindText:
+		// Fall through to the quoted-string path.
 	}
 
 	encoded, err := json.Marshal(s)

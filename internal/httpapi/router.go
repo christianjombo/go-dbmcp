@@ -52,7 +52,15 @@ func New(d Deps) *Server {
 		PoolCloseGrace:    5 * time.Second,
 	}
 
+	defaultEngine, err := dbconn.ParseEngine(d.Cfg.DefaultDBType)
+	if err != nil {
+		// Config validation already clamps this to a known value; belt and
+		// braces so a future edit cannot leave the engine empty.
+		defaultEngine = dbconn.EnginePostgres
+	}
+
 	defaults := dbconn.Defaults{
+		Engine:            defaultEngine,
 		Database:          d.Cfg.DefaultDatabase,
 		SSLMode:           d.Cfg.DefaultSSLMode,
 		BlockPrivateHosts: d.Cfg.BlockPrivateHosts,

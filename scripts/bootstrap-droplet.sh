@@ -112,12 +112,12 @@ else
   cp "$tmp/env.example" "$ETC_DIR/mcp-proxy.env"
   # Harden the defaults for a public multi-tenant deployment:
   #  - listen on loopback only, since nginx fronts us
-  #  - READ ONLY transactions, enforced by PostgreSQL rather than by regex
+  #  - writes left enabled (the command policy permits INSERT/UPDATE/DELETE);
+  #    set MCP_ALLOW_WRITES=false for a query-only deployment
   #  - refuse private/loopback targets so this host cannot be used to reach
   #    networks the caller should not be able to reach from the internet
   sed -i \
     -e 's|^MCP_LISTEN_ADDR=.*|MCP_LISTEN_ADDR=127.0.0.1:8080|' \
-    -e 's|^MCP_READ_ONLY_TX=.*|MCP_READ_ONLY_TX=true|' \
     -e 's|^MCP_BLOCK_PRIVATE_HOSTS=.*|MCP_BLOCK_PRIVATE_HOSTS=true|' \
     -e 's|^MCP_DISABLE_LOCALHOST_PROTECTION=.*|MCP_DISABLE_LOCALHOST_PROTECTION=true|' \
     "$ETC_DIR/mcp-proxy.env"

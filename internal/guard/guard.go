@@ -1,29 +1,36 @@
 // Package guard screens SQL before it reaches a tenant database.
 //
+// The model is an allowlist of statement-leading keywords, not a blocklist of
+// substrings. That distinction is the whole design:
+//
+//   - A statement is identified by the command keyword it *starts* with, and
+//     that keyword must be explicitly permitted. Anything unrecognised is
+//     refused, so a command nobody thought to list cannot slip through.
+//   - Keywords are therefore only meaningful in leading position. `SET` is a
+//     forbidden command, but `UPDATE t SET x = 1` is permitted — a substring
+//     scanner would reject that perfectly ordinary statement. Likewise
+//     `ANALYZE` is forbidden as a command while `EXPLAIN ANALYZE SELECT ...`
+//     is permitted, because there the word means "actually execute it".
+//   - Stacked statements are refused outright, which is what makes the
+//     leading-keyword check sufficient: there is only ever one command to
+//     judge.
+//
+// Comments, string literals, quoted identifiers and dollar-quoted bodies are
+// stripped before any of this, so `DROP/**/DATABASE x` is caught while
+// `SELECT 'drop database x'` and a column named `vacuum_log` are not.
+//
 // IMPORTANT, and stated plainly because it governs how much weight this code
-// can bear: a keyword scanner is a guardrail, not a security boundary. It
-// exists to stop a confused model from issuing a destructive statement by
-// accident. It cannot stop a determined adversary, because SQL has too many
-// ways to express the same intent. The real boundary is the privileges of the
-// role in the x-db-username header — give it SELECT and nothing else.
-//
-// What this package does buy, over the naive strings.Contains check:
-//
-//   - `DROP/**/DATABASE x` cannot slip through, because comments are replaced
-//     by whitespace before matching — the same thing PostgreSQL's own lexer
-//     does, so the scanner sees the statement the server would execute.
-//     (`DR/**/OP` needs no handling: splitting a keyword with a comment makes
-//     it two tokens, which the server rejects as a syntax error.)
-//   - `SELECT 'drop database x'` and a column named vacuum_log do not false
-//     positive, because string literals and quoted identifiers are removed
-//     before matching.
-//   - `SELECT 1; DROP DATABASE x` is rejected outright, because stacked
-//     statements are detected after literals are stripped.
+// can bear: this is a guardrail, not a security boundary. It stops a confused
+// model from issuing a destructive statement by accident. It cannot stop a
+// determined adversary, and it cannot see inside a stored procedure invoked
+// by CALL. The real boundary is the privileges granted to the role in the
+// x-db-username header.
 package guard
 
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode"
 )
@@ -31,71 +38,119 @@ import (
 // Decision is the outcome of screening one statement.
 type Decision struct {
 	Allowed bool
+	// Command is the leading keyword that was identified, when one was.
+	Command string
 	RuleID  string
 	Reason  string
 }
 
-// Rule is a single screening pattern applied to normalised SQL.
+// AllowedCommands are the statement-leading keywords this server will run.
+//
+// The configured policy also names clause keywords — JOIN, WHERE, GROUP BY,
+// ORDER BY, UNION, ON, USING and so on. Those cannot begin a statement; they
+// are permitted implicitly wherever they appear inside one of the commands
+// below, so listing them here would be meaningless.
+var AllowedCommands = map[string]string{
+	"SELECT":  "read rows",
+	"INSERT":  "add rows",
+	"UPDATE":  "modify rows",
+	"DELETE":  "remove rows",
+	"REPLACE": "insert-or-replace rows (MySQL)",
+	"MERGE":   "conditional insert/update/delete",
+	"WITH":    "common table expression",
+	"SHOW":    "inspect server or schema metadata",
+	"EXPLAIN": "inspect a query plan",
+	"CALL":    "invoke a stored procedure",
+}
+
+// DeniedCommands are refused with a specific explanation. Anything not in
+// AllowedCommands is refused regardless; this map exists so that the common
+// cases get a useful message instead of "unrecognised command".
+var DeniedCommands = map[string]string{
+	"DROP":     "DROP destroys schema objects irreversibly.",
+	"TRUNCATE": "TRUNCATE empties a table irreversibly and without row-level logging.",
+	"ALTER":    "ALTER changes schema or server configuration.",
+	"CREATE":   "CREATE adds schema objects; this service is for querying data, not defining it.",
+	"RENAME":   "RENAME changes object names other clients depend on.",
+	"GRANT":    "GRANT changes who can access this database.",
+	"REVOKE":   "REVOKE changes who can access this database.",
+	"VACUUM":   "VACUUM rewrites storage and can block normal traffic for a long time.",
+	"ANALYZE":  "ANALYZE as a statement rewrites planner statistics. (EXPLAIN ANALYZE is permitted.)",
+	"OPTIMIZE": "OPTIMIZE TABLE rebuilds storage and takes heavy locks.",
+	"KILL":     "KILL terminates other sessions.",
+	"SHUTDOWN": "SHUTDOWN stops the database server.",
+	"SET":      "SET changes session or server state. (The SET clause of an UPDATE is permitted.)",
+}
+
+// Rule is a contextual pattern applied to the body of an otherwise permitted
+// statement — the cases where the command is fine but a specific construct
+// inside it is not.
 type Rule struct {
-	ID      string
-	Pattern *regexp.Regexp
-	Reason  string
+	ID string
+	// OnlyWhenLeading, when non-empty, restricts the rule to statements
+	// beginning with that command.
+	OnlyWhenLeading string
+	Pattern         *regexp.Regexp
+	Reason          string
 }
 
-// Scanner screens statements against a rule set.
+// WriteCommands are the permitted commands that modify data. An operator can
+// withdraw them with MCP_ALLOW_WRITES=false.
+var WriteCommands = map[string]bool{
+	"INSERT": true, "UPDATE": true, "DELETE": true, "REPLACE": true, "MERGE": true,
+}
+
+// Scanner screens statements against the command policy and contextual rules.
 type Scanner struct {
-	rules []Rule
+	rules       []Rule
+	allowWrites bool
 }
 
-// defaultRules. The first two are mandated by the service spec; the rest
-// close off the adjacent ways to destroy, exfiltrate from, or execute code on
-// a target database.
-func defaultRules() []Rule {
-	mk := func(id, pattern, reason string) Rule {
-		return Rule{ID: id, Pattern: regexp.MustCompile(pattern), Reason: reason}
+// contextualRules catch constructs that a permitted command can still carry:
+// filesystem access and session control reachable from inside a plain SELECT.
+func contextualRules() []Rule {
+	mk := func(id, leading, pattern, reason string) Rule {
+		return Rule{ID: id, OnlyWhenLeading: leading, Pattern: regexp.MustCompile(pattern), Reason: reason}
 	}
 	return []Rule{
-		mk("drop_database", `\bDROP\s+DATABASE\b`,
-			"DROP DATABASE destroys an entire database and cannot be undone."),
-		mk("vacuum", `\bVACUUM\b`,
-			"VACUUM is a maintenance command that rewrites storage and can block normal traffic for a long time."),
+		// MySQL: writes a file on the database host.
+		mk("into_outfile", "", `\bINTO\s+(OUTFILE|DUMPFILE)\b`,
+			"SELECT ... INTO OUTFILE/DUMPFILE writes a file on the database server."),
 
-		mk("drop_schema", `\bDROP\s+SCHEMA\b`,
-			"DROP SCHEMA destroys every object in a schema."),
-		mk("drop_tablespace", `\bDROP\s+TABLESPACE\b`,
-			"DROP TABLESPACE removes a storage location used by live relations."),
-		mk("drop_principal", `\bDROP\s+(ROLE|USER|GROUP)\b`,
-			"Dropping a role or user changes who can reach this database."),
-		mk("drop_owned", `\bDROP\s+OWNED\b`,
-			"DROP OWNED removes every object belonging to a role."),
-		mk("truncate", `\bTRUNCATE\b`,
-			"TRUNCATE empties a table irreversibly and without row-level logging."),
-		mk("alter_system", `\bALTER\s+SYSTEM\b`,
-			"ALTER SYSTEM rewrites server configuration for every connection, not just this one."),
-		mk("maintenance", `\b(REINDEX|CLUSTER)\b`,
-			"REINDEX and CLUSTER take heavy locks and rewrite storage."),
+		// PostgreSQL: SELECT ... INTO creates a table, which is DDL wearing a
+		// SELECT costume. INSERT INTO is unaffected — that statement leads
+		// with INSERT, not SELECT.
+		mk("select_into", "SELECT", `\bINTO\b`,
+			"SELECT ... INTO creates a new table. Use INSERT INTO ... SELECT if you meant to copy rows."),
 
-		mk("copy_program", `\bCOPY\b[^;]*\bPROGRAM\b`,
-			"COPY ... PROGRAM executes a shell command on the database host."),
-		mk("server_file_access", `\b(PG_READ_FILE|PG_READ_BINARY_FILE|PG_LS_DIR|PG_STAT_FILE)\s*\(`,
-			"These functions read the database server's filesystem."),
-		mk("large_object_io", `\b(LO_IMPORT|LO_EXPORT)\s*\(`,
+		// Reading the database server's filesystem.
+		mk("server_file_read", "", `\b(LOAD_FILE|PG_READ_FILE|PG_READ_BINARY_FILE|PG_LS_DIR|PG_STAT_FILE)\s*\(`,
+			"These functions read files from the database server's filesystem."),
+		mk("large_object_io", "", `\b(LO_IMPORT|LO_EXPORT)\s*\(`,
 			"Large-object import/export reads and writes files on the database host."),
-		mk("backend_control", `\b(PG_TERMINATE_BACKEND|PG_CANCEL_BACKEND|PG_RELOAD_CONF)\s*\(`,
-			"These functions disrupt other sessions or reload server configuration."),
-		mk("untrusted_language", `\bLANGUAGE\s+("?C"?|INTERNAL)\b`,
-			"Functions in C or internal language can execute arbitrary native code."),
-		mk("anonymous_block", `^\s*DO\b`,
-			"An anonymous DO block can run arbitrary procedural code, which this scanner cannot inspect."),
+
+		// PostgreSQL equivalents of KILL and SHUTDOWN, reachable from SELECT.
+		mk("backend_control", "", `\b(PG_TERMINATE_BACKEND|PG_CANCEL_BACKEND|PG_RELOAD_CONF)\s*\(`,
+			"These functions terminate other sessions or reload server configuration."),
+
+		// COPY ... PROGRAM executes a shell command. COPY is not an allowed
+		// command, so this is defence in depth for any path that reaches the
+		// body check with COPY still present.
+		mk("copy_program", "", `\bCOPY\b[^;]*\bPROGRAM\b`,
+			"COPY ... PROGRAM executes a shell command on the database host."),
 	}
 }
 
-// New builds a Scanner from the default rules plus any operator-supplied
+// New builds a Scanner from the contextual rules plus any operator-supplied
 // patterns. A pattern that fails to compile is skipped and reported as a
 // warning rather than aborting boot: a typo in a unit file must not take the
 // service down, but it must be visible.
-func New(extraPatterns []string) (*Scanner, []string) {
-	s := &Scanner{rules: defaultRules()}
+// allowWrites controls whether INSERT, UPDATE, DELETE, REPLACE and MERGE are
+// permitted. Note that this is a guardrail toggle, not an enforcement
+// mechanism: the dependable way to make a connection read-only is to grant
+// the role nothing but SELECT.
+func New(extraPatterns []string, allowWrites bool) (*Scanner, []string) {
+	s := &Scanner{rules: contextualRules(), allowWrites: allowWrites}
 	var warnings []string
 
 	for i, p := range extraPatterns {
@@ -114,34 +169,94 @@ func New(extraPatterns []string) (*Scanner, []string) {
 	return s, warnings
 }
 
-// Inspect screens a statement. The returned Decision is advisory metadata for
-// the caller to render; it performs no I/O.
+// Inspect screens a statement. It performs no I/O.
 func (s *Scanner) Inspect(sql string) Decision {
 	normalised := Normalize(sql)
 
 	if normalised == "" {
 		return Decision{
-			Allowed: false,
-			RuleID:  "empty_statement",
-			Reason:  "The statement was empty once comments were stripped, so there was nothing to run.",
+			RuleID: "empty_statement",
+			Reason: "The statement was empty once comments were stripped, so there was nothing to run.",
 		}
 	}
 
 	if n := countStatements(normalised); n > 1 {
 		return Decision{
-			Allowed: false,
-			RuleID:  "stacked_statements",
-			Reason: fmt.Sprintf("Found %d statements separated by ';'. Only one statement may be sent per call, "+
-				"because a benign leading statement can hide a destructive trailing one.", n),
+			RuleID: "stacked_statements",
+			Reason: fmt.Sprintf("Found %d statements separated by ';'. Send one statement per call — "+
+				"a benign leading statement can otherwise hide a destructive trailing one.", n),
+		}
+	}
+
+	command := LeadingCommand(normalised)
+	if command == "" {
+		return Decision{
+			RuleID: "unparseable",
+			Reason: "Could not identify a leading SQL command in this statement.",
+		}
+	}
+
+	if reason, denied := DeniedCommands[command]; denied {
+		return Decision{
+			Command: command,
+			RuleID:  "command_not_allowed",
+			Reason:  reason,
+		}
+	}
+
+	if _, allowed := AllowedCommands[command]; !allowed {
+		return Decision{
+			Command: command,
+			RuleID:  "command_not_recognised",
+			Reason: fmt.Sprintf("%s is not among the commands this server permits. "+
+				"Allowed commands are: %s.", command, allowedList()),
+		}
+	}
+
+	if WriteCommands[command] && !s.allowWrites {
+		return Decision{
+			Command: command,
+			RuleID:  "writes_disabled",
+			Reason: fmt.Sprintf("%s modifies data, and this server is configured for read-only access "+
+				"(MCP_ALLOW_WRITES=false). Only queries are accepted.", command),
 		}
 	}
 
 	for _, r := range s.rules {
+		if r.OnlyWhenLeading != "" && r.OnlyWhenLeading != command {
+			continue
+		}
 		if r.Pattern.MatchString(normalised) {
-			return Decision{Allowed: false, RuleID: r.ID, Reason: r.Reason}
+			return Decision{Command: command, RuleID: r.ID, Reason: r.Reason}
 		}
 	}
-	return Decision{Allowed: true}
+
+	return Decision{Allowed: true, Command: command}
+}
+
+func allowedList() string {
+	names := make([]string, 0, len(AllowedCommands))
+	for k := range AllowedCommands {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
+// LeadingCommand returns the command keyword a normalised statement begins
+// with, skipping any opening parentheses so that `(SELECT ...) UNION
+// (SELECT ...)` is recognised as a SELECT.
+func LeadingCommand(normalised string) string {
+	s := strings.TrimLeft(normalised, "( \t\n")
+	end := 0
+	for end < len(s) && (isWordByte(s[end])) {
+		end++
+	}
+	return s[:end]
+}
+
+func isWordByte(b byte) bool {
+	return b == '_' || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
 }
 
 // Normalize strips comments, string literals, quoted identifiers and
@@ -178,19 +293,28 @@ func Normalize(sql string) string {
 			}
 			b.WriteByte(' ')
 
-		// Line comment.
+		// Line comment: -- to end of line.
 		case c == '-' && i+1 < n && rs[i+1] == '-':
 			for i < n && rs[i] != '\n' {
 				i++
 			}
 			b.WriteByte(' ')
 
-		// String literal. E'' allows backslash escapes; '' doubling otherwise.
+		// MySQL also accepts # as a line comment.
+		case c == '#':
+			for i < n && rs[i] != '\n' {
+				i++
+			}
+			b.WriteByte(' ')
+
+		// String literal. E'...' allows backslash escapes; MySQL allows
+		// backslash escapes in ordinary literals too, so they are always
+		// honoured — over-consuming an escape cannot hide a keyword, it can
+		// only end the literal later than a strict parser would.
 		case c == '\'':
-			escapeString := precedingEscapeMarker(rs, i)
 			i++
 			for i < n {
-				if escapeString && rs[i] == '\\' {
+				if rs[i] == '\\' && i+1 < n {
 					i += 2
 					continue
 				}
@@ -206,7 +330,7 @@ func Normalize(sql string) string {
 			}
 			b.WriteString(" '' ")
 
-		// Quoted identifier.
+		// Quoted identifier (SQL standard / PostgreSQL).
 		case c == '"':
 			i++
 			for i < n {
@@ -222,7 +346,23 @@ func Normalize(sql string) string {
 			}
 			b.WriteString(` "" `)
 
-		// Dollar-quoted body: $$...$$ or $tag$...$tag$.
+		// Backtick-quoted identifier (MySQL).
+		case c == '`':
+			i++
+			for i < n {
+				if rs[i] == '`' {
+					if i+1 < n && rs[i+1] == '`' {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+			b.WriteString(" `` ")
+
+		// Dollar-quoted body: $$...$$ or $tag$...$tag$ (PostgreSQL).
 		case c == '$':
 			if tag, bodyStart, ok := dollarTag(rs, i); ok {
 				closer := "$" + tag + "$"
@@ -245,25 +385,6 @@ func Normalize(sql string) string {
 	}
 
 	return collapseSpace(strings.ToUpper(b.String()))
-}
-
-// precedingEscapeMarker reports whether the quote at index i opens an
-// escape string of the form E'...', i.e. is immediately preceded by a
-// standalone E or e.
-func precedingEscapeMarker(rs []rune, i int) bool {
-	if i == 0 {
-		return false
-	}
-	p := rs[i-1]
-	if p != 'E' && p != 'e' {
-		return false
-	}
-	if i-1 == 0 {
-		return true
-	}
-	// The E must be its own token, not the tail of an identifier.
-	prev := rs[i-2]
-	return !unicode.IsLetter(prev) && !unicode.IsDigit(prev) && prev != '_'
 }
 
 // dollarTag recognises a dollar-quote opener at rs[i] == '$' and returns the
@@ -301,16 +422,18 @@ func countStatements(normalised string) int {
 	return count
 }
 
-// BlockMessage renders the "structural warning text" returned to the model
-// when a statement is refused. It names the rule so the model can adapt
-// rather than blindly retrying the same thing.
+// BlockMessage renders the refusal returned to the model. It names the rule
+// and lists what is permitted, so the model can adapt rather than retrying
+// the same thing.
 func BlockMessage(d Decision) string {
-	return fmt.Sprintf(`⛔ QUERY BLOCKED BY SAFETY GUARDRAIL
-
-Rule:   %s
-Reason: %s
-
-The statement was NOT sent to the database. Nothing was executed and nothing changed.
-Rewrite the query as a read-only statement, or ask the user to perform this operation
-directly against their database if it is genuinely intended.`, d.RuleID, d.Reason)
+	var b strings.Builder
+	b.WriteString("⛔ QUERY BLOCKED BY SAFETY GUARDRAIL\n\n")
+	if d.Command != "" {
+		fmt.Fprintf(&b, "Command: %s\n", d.Command)
+	}
+	fmt.Fprintf(&b, "Rule:    %s\nReason:  %s\n\n", d.RuleID, d.Reason)
+	b.WriteString("The statement was NOT sent to the database. Nothing was executed and nothing changed.\n\n")
+	fmt.Fprintf(&b, "Permitted commands: %s.\n", allowedList())
+	b.WriteString("Schema changes and administrative commands must be performed by the database owner directly.")
+	return b.String()
 }

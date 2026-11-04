@@ -15,6 +15,7 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -58,6 +59,22 @@ func (t headerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return base.RoundTrip(clone)
 }
 
+// targetEngine is resolved from the DSN scheme so the same suite runs
+// against either engine.
+func targetEngine(t *testing.T) string {
+	t.Helper()
+	u, err := url.Parse(os.Getenv("DBMCP_E2E_DSN"))
+	if err != nil {
+		t.Fatalf("DBMCP_E2E_DSN is not a valid URL: %v", err)
+	}
+	if strings.HasPrefix(u.Scheme, "mysql") || strings.HasPrefix(u.Scheme, "maria") {
+		return "mysql"
+	}
+	return "postgres"
+}
+
+func isMySQL(t *testing.T) bool { return targetEngine(t) == "mysql" }
+
 func dsnToHeaders(t *testing.T, dsn string) map[string]string {
 	t.Helper()
 
@@ -65,16 +82,23 @@ func dsnToHeaders(t *testing.T, dsn string) map[string]string {
 	if err != nil {
 		t.Fatalf("DBMCP_E2E_DSN is not a valid URL: %v", err)
 	}
+	engine := targetEngine(t)
+
 	pw, _ := u.User.Password()
 	port := u.Port()
 	if port == "" {
-		port = "5432"
+		if engine == "mysql" {
+			port = "3306"
+		} else {
+			port = "5432"
+		}
 	}
 	sslmode := u.Query().Get("sslmode")
 	if sslmode == "" {
 		sslmode = "disable"
 	}
 	return map[string]string{
+		"x-db-type":     engine,
 		"x-db-username": u.User.Username(),
 		"x-db-password": pw,
 		"x-db-host":     u.Hostname(),
@@ -82,6 +106,21 @@ func dsnToHeaders(t *testing.T, dsn string) map[string]string {
 		"x-db-database": strings.TrimPrefix(u.Path, "/"),
 		"x-db-sslmode":  sslmode,
 	}
+}
+
+// seriesSQL produces n rows with an `id` and a `label` column. PostgreSQL has
+// generate_series; MySQL's recursive CTE is capped at cte_max_recursion_depth
+// (1000 by default) and raising it needs SET, which the guard refuses — so
+// information_schema is used as a readily available source of volume.
+func seriesSQL(t *testing.T, n int) string {
+	t.Helper()
+	if isMySQL(t) {
+		return fmt.Sprintf(
+			"SELECT ordinal_position AS id, column_name AS label "+
+				"FROM information_schema.columns LIMIT %d", n)
+	}
+	return fmt.Sprintf(
+		"SELECT g AS id, 'row-' || g AS label FROM generate_series(1, %d) g", n)
 }
 
 // connect starts the proxy in-process and returns an initialized MCP session.
@@ -93,7 +132,7 @@ func connect(t *testing.T) *mcp.ClientSession {
 		t.Skip("set DBMCP_E2E_DSN to run end-to-end tests against a live PostgreSQL")
 	}
 
-	scanner, _ := guard.New(nil)
+	scanner, _ := guard.New(nil, true)
 	deps := httpapi.Deps{
 		Cfg: &config.Config{
 			Version:             "e2e",
@@ -208,9 +247,17 @@ func TestTier1SmallResultIsJSON(t *testing.T) {
 	if !strings.HasPrefix(text, "Format: application/json") {
 		t.Fatalf("expected a JSON tier response, got:\n%s", firstLines(text, 6))
 	}
-	for _, want := range []string{`"n":1`, `"greeting":"hello"`, `"flag":true`, `"nothing":null`} {
-		if !strings.Contains(text, want) {
-			t.Errorf("missing %s in:\n%s", want, text)
+	want := []string{`"n":1`, `"greeting":"hello"`, `"nothing":null`}
+	if isMySQL(t) {
+		// MySQL has no boolean type: TRUE is an alias for the integer 1 and
+		// the column comes back as BIGINT, so it is a JSON number.
+		want = append(want, `"flag":1`)
+	} else {
+		want = append(want, `"flag":true`)
+	}
+	for _, w := range want {
+		if !strings.Contains(text, w) {
+			t.Errorf("missing %s in:\n%s", w, text)
 		}
 	}
 }
@@ -219,8 +266,7 @@ func TestTier1SmallResultIsJSON(t *testing.T) {
 func TestTier2MediumResultIsCSV(t *testing.T) {
 	s := connect(t)
 
-	text, isErr := callQuery(t, s,
-		"SELECT g AS id, 'row-' || g AS label FROM generate_series(1, 500) g")
+	text, isErr := callQuery(t, s, seriesSQL(t, 500))
 	if isErr {
 		t.Fatalf("query failed: %s", text)
 	}
@@ -242,7 +288,7 @@ func TestTier2MediumResultIsCSV(t *testing.T) {
 func TestTier3LargeResultIsTruncatedAndWarned(t *testing.T) {
 	s := connect(t)
 
-	text, isErr := callQuery(t, s, "SELECT g AS id FROM generate_series(1, 5000) g")
+	text, isErr := callQuery(t, s, seriesSQL(t, 5000))
 	if isErr {
 		t.Fatalf("query failed: %s", text)
 	}
@@ -303,10 +349,17 @@ func TestNullAndEmptyStringAreDistinctInCSV(t *testing.T) {
 	s := connect(t)
 
 	// 150 rows forces the CSV tier, where the distinction actually matters.
-	text, isErr := callQuery(t, s, `
+	query := `
 		SELECT g AS id,
 		       CASE WHEN g = 1 THEN NULL WHEN g = 2 THEN '' ELSE 'x' END AS v
-		  FROM generate_series(1, 150) g`)
+		  FROM generate_series(1, 150) g`
+	if isMySQL(t) {
+		query = `
+			SELECT ordinal_position AS id,
+			       CASE ordinal_position WHEN 1 THEN NULL WHEN 2 THEN '' ELSE 'x' END AS v
+			  FROM information_schema.columns LIMIT 150`
+	}
+	text, isErr := callQuery(t, s, query)
 	if isErr {
 		t.Fatalf("query failed: %s", text)
 	}
@@ -330,26 +383,48 @@ func TestSQLErrorIsReportedWithDiagnostics(t *testing.T) {
 	if !isErr {
 		t.Fatalf("expected a tool error, got:\n%s", text)
 	}
-	if !strings.Contains(text, "SQLSTATE") || !strings.Contains(text, "42P01") {
-		t.Errorf("error should carry SQLSTATE 42P01:\n%s", text)
+	if !strings.Contains(text, "SQL ERROR") {
+		t.Errorf("error should be reported as a SQL error:\n%s", text)
+	}
+	// MySQL answers 1146 for a missing user table but 1109 inside
+	// information_schema; both carry SQLSTATE 42S02, so assert the SQLSTATE
+	// rather than the vendor number.
+	code := "42P01" // PostgreSQL undefined_table
+	if isMySQL(t) {
+		code = "42S02"
+	}
+	if !strings.Contains(text, code) {
+		t.Errorf("error should carry SQLSTATE %s:\n%s", code, text)
 	}
 }
 
 func TestListTablesAndDescribeTable(t *testing.T) {
 	s := connect(t)
 
-	if text, isErr := callTool(t, s, "list_tables", map[string]any{"schema": "information_schema"}); isErr {
+	// No schema filter: system schemas are excluded by design, so asking for
+	// information_schema specifically would correctly return nothing.
+	text, isErr := callTool(t, s, "list_tables", nil)
+	if isErr {
 		t.Fatalf("list_tables failed: %s", text)
-	} else if !strings.Contains(text, "information_schema") {
-		t.Errorf("expected information_schema tables:\n%s", firstLines(text, 8))
+	}
+	if !strings.Contains(text, "Format:") {
+		t.Errorf("list_tables returned no metadata block:\n%s", firstLines(text, 8))
+	}
+	for _, system := range []string{"pg_catalog", "performance_schema"} {
+		if strings.Contains(text, system) {
+			t.Errorf("system schema %s must be excluded from the listing", system)
+		}
 	}
 
-	text, isErr := callTool(t, s, "describe_table", map[string]any{"table": "tables", "schema": "information_schema"})
+	// information_schema.TABLES exists on both engines.
+	desc, isErr := callTool(t, s, "describe_table",
+		map[string]any{"table": "tables", "schema": "information_schema"})
 	if isErr {
-		t.Fatalf("describe_table failed: %s", text)
+		t.Fatalf("describe_table failed: %s", desc)
 	}
-	if !strings.Contains(text, "table_name") {
-		t.Errorf("expected a table_name column:\n%s", firstLines(text, 10))
+	// MySQL reports information_schema identifiers in upper case.
+	if !strings.Contains(strings.ToLower(desc), "table_name") {
+		t.Errorf("expected a table_name column:\n%s", firstLines(desc, 10))
 	}
 }
 
@@ -359,7 +434,11 @@ func TestNumericPrecisionIsPreserved(t *testing.T) {
 	s := connect(t)
 
 	const want = "12345678901234567890.123456789"
-	text, isErr := callQuery(t, s, "SELECT "+want+"::numeric AS amount")
+	query := "SELECT " + want + "::numeric AS amount"
+	if isMySQL(t) {
+		query = "SELECT CAST('" + want + "' AS DECIMAL(40,9)) AS amount"
+	}
+	text, isErr := callQuery(t, s, query)
 	if isErr {
 		t.Fatalf("query failed: %s", text)
 	}

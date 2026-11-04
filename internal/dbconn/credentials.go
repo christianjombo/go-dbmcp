@@ -27,6 +27,7 @@ import (
 // Canonical header names. Go's http.Header canonicalises on access, so these
 // match case-insensitively on the wire.
 const (
+	HeaderType     = "X-Db-Type"
 	HeaderUsername = "X-Db-Username"
 	HeaderPassword = "X-Db-Password"
 	HeaderHost     = "X-Db-Host"
@@ -38,6 +39,7 @@ const (
 // WireHeaderNames is the lowercase, client-facing spelling, used in docs and
 // error payloads.
 var WireHeaderNames = map[string]string{
+	HeaderType:     "x-db-type",
 	HeaderUsername: "x-db-username",
 	HeaderPassword: "x-db-password",
 	HeaderHost:     "x-db-host",
@@ -48,12 +50,16 @@ var WireHeaderNames = map[string]string{
 
 // Credentials is a validated, ready-to-dial target database.
 type Credentials struct {
+	Engine   Engine
 	Username string
 	Password string
 	Host     string
 	Port     int
 	Database string
-	SSLMode  string
+	// SSLMode is expressed in libpq vocabulary regardless of engine. For
+	// MySQL it is translated to the driver's TLS setting (see mysqlTLS), so
+	// clients configure one header the same way for both engines.
+	SSLMode string
 }
 
 // ValidationError reports everything wrong with a request at once, so a client
@@ -91,6 +97,7 @@ func sortedKeys(m map[string]string) []string {
 
 // Defaults supplies the fallback values for the optional headers.
 type Defaults struct {
+	Engine   Engine
 	Database string
 	SSLMode  string
 	// BlockPrivateHosts rejects literal addresses in loopback, private and
@@ -135,6 +142,22 @@ func FromHeaders(h http.Header, d Defaults) (*Credentials, error) {
 
 	c := &Credentials{Password: password}
 
+	// x-db-type is optional and falls back to the server default, so an
+	// existing PostgreSQL-only client keeps working unchanged.
+	if dbType, hasType := get(HeaderType); hasType && dbType != "" {
+		engine, err := ParseEngine(dbType)
+		if err != nil {
+			ve.Invalid[WireHeaderNames[HeaderType]] = err.Error()
+		} else {
+			c.Engine = engine
+		}
+	} else {
+		c.Engine = d.Engine
+	}
+	if c.Engine == "" {
+		c.Engine = EnginePostgres
+	}
+
 	if hasUser {
 		if err := validIdentifier(username, 63); err != nil {
 			ve.Invalid[WireHeaderNames[HeaderUsername]] = err.Error()
@@ -158,7 +181,8 @@ func FromHeaders(h http.Header, d Defaults) (*Credentials, error) {
 		p, err := strconv.Atoi(portRaw)
 		switch {
 		case err != nil:
-			ve.Invalid[WireHeaderNames[HeaderPort]] = fmt.Sprintf("%q is not a number", portRaw)
+			ve.Invalid[WireHeaderNames[HeaderPort]] = fmt.Sprintf(
+				"%q is not a number (the conventional port for %s is %d)", portRaw, c.Engine, c.Engine.DefaultPort())
 		case p < 1 || p > 65535:
 			ve.Invalid[WireHeaderNames[HeaderPort]] = fmt.Sprintf("%d is outside 1-65535", p)
 		default:
@@ -292,9 +316,10 @@ func VerifyResolvedHost(ctx context.Context, resolver *net.Resolver, host string
 	return nil
 }
 
-// DSN assembles a libpq connection URI. net/url performs the escaping, so a
-// password containing '@', '/', ':' or '?' cannot restructure the URI.
-func (c *Credentials) DSN() string {
+// postgresDSN assembles a libpq connection URI. net/url performs the
+// escaping, so a password containing '@', '/', ':' or '?' cannot restructure
+// the URI.
+func (c *Credentials) postgresDSN() string {
 	u := &url.URL{
 		Scheme: "postgres",
 		User:   url.UserPassword(c.Username, c.Password),
@@ -308,29 +333,52 @@ func (c *Credentials) DSN() string {
 	return u.String()
 }
 
+// mysqlTLS translates a libpq sslmode into the go-sql-driver TLS setting, so
+// clients configure one header identically for both engines.
+//
+// verify-ca is mapped to full verification rather than to a weaker custom
+// mode: erring towards the stricter check cannot expose a connection that
+// the requested mode would have protected.
+func (c *Credentials) mysqlTLS() string {
+	switch c.SSLMode {
+	case "disable":
+		return "false"
+	case "allow", "prefer":
+		return "preferred"
+	case "require":
+		return "skip-verify" // encrypted, certificate not validated
+	case "verify-ca", "verify-full":
+		return "true" // encrypted, certificate and hostname validated
+	default:
+		return "preferred"
+	}
+}
+
 // Fingerprint is a stable, non-reversible handle for correlating log lines
 // belonging to the same target. The password is deliberately excluded so that
 // a fingerprint can never be used to confirm a guessed password.
 func (c *Credentials) Fingerprint() string {
-	sum := sha256.Sum256([]byte(c.Username + "\x00" + c.Host + "\x00" +
-		strconv.Itoa(c.Port) + "\x00" + c.Database))
+	sum := sha256.Sum256([]byte(string(c.Engine) + "\x00" + c.Username + "\x00" +
+		c.Host + "\x00" + strconv.Itoa(c.Port) + "\x00" + c.Database))
 	return hex.EncodeToString(sum[:8])
 }
 
 // Target is the human-readable destination, without credentials.
 func (c *Credentials) Target() string {
-	return fmt.Sprintf("%s:%d/%s", c.Host, c.Port, c.Database)
+	return fmt.Sprintf("%s://%s:%d/%s", c.Engine, c.Host, c.Port, c.Database)
 }
 
 // String implements fmt.Stringer with the password redacted.
 func (c *Credentials) String() string {
-	return fmt.Sprintf("postgres://%s:REDACTED@%s?sslmode=%s", c.Username, c.Target(), c.SSLMode)
+	return fmt.Sprintf("%s://%s:REDACTED@%s:%d/%s?sslmode=%s",
+		c.Engine, c.Username, c.Host, c.Port, c.Database, c.SSLMode)
 }
 
 // LogValue implements slog.LogValuer so structured logging cannot leak a
 // password even if a Credentials value is passed to a logger wholesale.
 func (c *Credentials) LogValue() slog.Value {
 	return slog.GroupValue(
+		slog.String("engine", string(c.Engine)),
 		slog.String("user", c.Username),
 		slog.String("target", c.Target()),
 		slog.String("sslmode", c.SSLMode),

@@ -9,8 +9,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ErrSessionClosed is returned once the owning SSE stream has gone away.
@@ -50,7 +48,7 @@ type Session struct {
 	cancel context.CancelFunc
 
 	mu     sync.Mutex
-	pool   *pgxpool.Pool
+	pool   Pool
 	closed bool
 }
 
@@ -76,7 +74,7 @@ func NewSession(parent context.Context, creds *Credentials, cfg SessionConfig, l
 }
 
 // Acquire returns the pool, creating and verifying it on first use.
-func (s *Session) Acquire(ctx context.Context) (*pgxpool.Pool, error) {
+func (s *Session) Acquire(ctx context.Context) (Pool, error) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -111,7 +109,7 @@ func (s *Session) Acquire(ctx context.Context) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-func (s *Session) build(ctx context.Context) (*pgxpool.Pool, error) {
+func (s *Session) build(ctx context.Context) (Pool, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, s.cfg.ConnectTimeout)
 	defer cancel()
 
@@ -120,26 +118,24 @@ func (s *Session) build(ctx context.Context) (*pgxpool.Pool, error) {
 		return nil, err
 	}
 
-	pc, err := pgxpool.ParseConfig(s.creds.DSN())
-	if err != nil {
-		// Cannot surface err verbatim: pgx echoes the connection string,
-		// which contains the tenant's password.
-		return nil, fmt.Errorf("invalid connection parameters for %s", s.creds.Target())
+	var (
+		pool Pool
+		err  error
+	)
+	switch s.creds.Engine {
+	case EngineMySQL:
+		pool, err = openMySQL(dialCtx, s.creds, s.cfg)
+	case EnginePostgres:
+		pool, err = openPostgres(dialCtx, s.creds, s.cfg)
+	default:
+		return nil, fmt.Errorf("unsupported database type %q", s.creds.Engine)
 	}
-	pc.MaxConns = s.cfg.MaxConns
-	pc.MinConns = 0
-	pc.MaxConnIdleTime = s.cfg.MaxConnIdleTime
-	pc.MaxConnLifetime = s.cfg.MaxConnLifetime
-	pc.HealthCheckPeriod = 30 * time.Second
-	pc.ConnConfig.ConnectTimeout = s.cfg.ConnectTimeout
-
-	pool, err := pgxpool.NewWithConfig(dialCtx, pc)
 	if err != nil {
 		return nil, fmt.Errorf("could not initialise connection pool for %s: %w",
 			s.creds.Target(), redact(err, s.creds))
 	}
 
-	// pgxpool.NewWithConfig is lazy; ping so that a bad password surfaces here
+	// Both drivers connect lazily; ping so that a bad password surfaces here
 	// with a clear message instead of midway through a tool call.
 	if err := pool.Ping(dialCtx); err != nil {
 		pool.Close()
@@ -147,7 +143,8 @@ func (s *Session) build(ctx context.Context) (*pgxpool.Pool, error) {
 			s.creds.Target(), s.creds.Username, redact(err, s.creds))
 	}
 
-	s.log.Info("database pool established", "maxConns", s.cfg.MaxConns)
+	s.log.Info("database pool established",
+		"engine", string(s.creds.Engine), "maxConns", s.cfg.MaxConns)
 	return pool, nil
 }
 

@@ -137,7 +137,7 @@ func TestIPv6HostIsAccepted(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// JoinHostPort must bracket the address, or the DSN is unparseable.
-	if !strings.Contains(c.DSN(), "[2001:db8::1]:5432") {
+	if !strings.Contains(c.postgresDSN(), "[2001:db8::1]:5432") {
 		t.Errorf("IPv6 host not bracketed in DSN: %s", c.String())
 	}
 }
@@ -181,7 +181,7 @@ func TestDSNEscapesCredentials(t *testing.T) {
 		SSLMode:  "require",
 	}
 
-	u, err := url.Parse(c.DSN())
+	u, err := url.Parse(c.postgresDSN())
 	if err != nil {
 		t.Fatalf("DSN does not parse: %v", err)
 	}

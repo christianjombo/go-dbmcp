@@ -34,6 +34,7 @@ type Config struct {
 	CSVMaxRows  int
 
 	// Defaults applied to optional x-db-* headers.
+	DefaultDBType   string
 	DefaultDatabase string
 	DefaultSSLMode  string
 
@@ -50,7 +51,12 @@ type Config struct {
 	MaxResultBytes int
 
 	// Guardrails.
-	ReadOnlyTx           bool
+	//
+	// AllowWrites keeps INSERT, UPDATE, DELETE, REPLACE and MERGE in the
+	// permitted command set. Setting it false is a convenience, not an
+	// enforcement mechanism: the dependable way to make access read-only is
+	// to grant the role in x-db-username nothing but SELECT.
+	AllowWrites          bool
 	BlockPrivateHosts    bool
 	ExtraBlockedPatterns []string
 
@@ -82,6 +88,7 @@ func Load(version string) (*Config, []string) {
 		JSONMaxRows: envInt("MCP_JSON_MAX_ROWS", DefaultJSONMaxRows, 1, 1_000_000, w),
 		CSVMaxRows:  envInt("MCP_CSV_MAX_ROWS", DefaultCSVMaxRows, 1, 10_000_000, w),
 
+		DefaultDBType:   strings.ToLower(envStr("MCP_DEFAULT_DB_TYPE", "postgres")),
 		DefaultDatabase: envStr("MCP_DEFAULT_DATABASE", "postgres"),
 		DefaultSSLMode:  envStr("MCP_DEFAULT_SSLMODE", "prefer"),
 
@@ -93,7 +100,7 @@ func Load(version string) (*Config, []string) {
 
 		MaxResultBytes: envInt("MCP_MAX_RESULT_BYTES", 32<<20, 64<<10, 1<<30, w),
 
-		ReadOnlyTx:                 envBool("MCP_READ_ONLY_TX", false, w),
+		AllowWrites:                envBool("MCP_ALLOW_WRITES", true, w),
 		BlockPrivateHosts:          envBool("MCP_BLOCK_PRIVATE_HOSTS", false, w),
 		DisableLocalhostProtection: envBool("MCP_DISABLE_LOCALHOST_PROTECTION", false, w),
 
@@ -115,6 +122,13 @@ func Load(version string) (*Config, []string) {
 		w("MCP_JSON_MAX_ROWS (%d) exceeds MCP_CSV_MAX_ROWS (%d); raising the CSV ceiling to match",
 			c.JSONMaxRows, c.CSVMaxRows)
 		c.CSVMaxRows = c.JSONMaxRows
+	}
+
+	switch c.DefaultDBType {
+	case "postgres", "postgresql", "pg", "psql", "mysql", "mariadb":
+	default:
+		w("MCP_DEFAULT_DB_TYPE %q is not a supported database type; falling back to \"postgres\"", c.DefaultDBType)
+		c.DefaultDBType = "postgres"
 	}
 
 	if !validSSLMode(c.DefaultSSLMode) {
@@ -155,7 +169,8 @@ func (c *Config) Redacted() []any {
 		"defaultSSLMode", c.DefaultSSLMode,
 		"queryTimeout", c.QueryTimeout.String(),
 		"poolMaxConns", c.PoolMaxConns,
-		"readOnlyTx", c.ReadOnlyTx,
+		"defaultDbType", c.DefaultDBType,
+		"allowWrites", c.AllowWrites,
 		"blockPrivateHosts", c.BlockPrivateHosts,
 	}
 }

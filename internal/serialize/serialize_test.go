@@ -11,7 +11,7 @@ import (
 func cols(names ...string) []Column {
 	out := make([]Column, len(names))
 	for i, n := range names {
-		out[i] = Column{Name: n, TypeName: "text", OID: 25}
+		out[i] = Column{Name: n, TypeName: "text", Kind: KindText}
 	}
 	return out
 }
@@ -203,12 +203,12 @@ func TestNullIsDistinguishableFromEmptyString(t *testing.T) {
 
 func TestJSONPreservesColumnOrderAndTypes(t *testing.T) {
 	c := []Column{
-		{Name: "id", OID: 23, TypeName: "int4"},
-		{Name: "amount", OID: 1700, TypeName: "numeric"},
-		{Name: "active", OID: 16, TypeName: "bool"},
-		{Name: "meta", OID: 3802, TypeName: "jsonb"},
-		{Name: "name", OID: 25, TypeName: "text"},
-		{Name: "missing", OID: 25, TypeName: "text"},
+		{Name: "id", Kind: KindNumber, TypeName: "int4"},
+		{Name: "amount", Kind: KindNumber, TypeName: "numeric"},
+		{Name: "active", Kind: KindBool, TypeName: "bool"},
+		{Name: "meta", Kind: KindJSON, TypeName: "jsonb"},
+		{Name: "name", Kind: KindText, TypeName: "text"},
+		{Name: "missing", Kind: KindText, TypeName: "text"},
 	}
 	rows := []Row{{
 		[]byte("7"),
@@ -262,7 +262,7 @@ func TestJSONPreservesColumnOrderAndTypes(t *testing.T) {
 // NaN and Infinity are legal PostgreSQL float values but illegal JSON
 // numbers, so they must degrade to strings rather than emit invalid JSON.
 func TestJSONNonFiniteNumbersBecomeStrings(t *testing.T) {
-	c := []Column{{Name: "v", OID: 701, TypeName: "float8"}}
+	c := []Column{{Name: "v", Kind: KindNumber, TypeName: "float8"}}
 	res, err := Rows(c, []Row{{[]byte("NaN")}, {[]byte("Infinity")}}, opts(10, 100))
 	if err != nil {
 		t.Fatal(err)
@@ -296,7 +296,7 @@ func TestDuplicateColumnNamesAreDisambiguated(t *testing.T) {
 }
 
 func TestMetadataListsColumnsAndTypes(t *testing.T) {
-	c := []Column{{Name: "id", OID: 23, TypeName: "int4"}, {Name: "email", OID: 25, TypeName: "text"}}
+	c := []Column{{Name: "id", Kind: KindNumber, TypeName: "int4"}, {Name: "email", Kind: KindText, TypeName: "text"}}
 	res, err := Rows(c, textRows(1, 2), opts(10, 100))
 	if err != nil {
 		t.Fatal(err)

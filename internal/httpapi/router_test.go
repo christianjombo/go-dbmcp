@@ -18,7 +18,7 @@ import (
 
 func testDeps(t *testing.T) Deps {
 	t.Helper()
-	scanner, _ := guard.New(nil)
+	scanner, _ := guard.New(nil, true)
 	return Deps{
 		Cfg: &config.Config{
 			Version:             "test",

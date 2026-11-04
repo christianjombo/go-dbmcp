@@ -1,8 +1,8 @@
 # mcp-proxy
 
 A stateless, multi-tenant **Model Context Protocol** server over SSE that lets AI
-clients (Cursor, Claude Desktop) connect to **any** PostgreSQL database by passing
-credentials as HTTP headers.
+clients (Cursor, Claude Desktop) connect to **any PostgreSQL or MySQL/MariaDB**
+database by passing credentials as HTTP headers.
 
 There is no user table, no credential vault and no session store. Each client
 supplies its own target; a connection pool is created for the life of that
@@ -41,7 +41,8 @@ Ships as **one static binary** with no runtime dependencies, run under systemd.
                                       │                    │
                                       │ 1 stream           │
                                       │   = 1 MCP server   │     ┌─────────────┐
-                                      │   = 1 pgx pool  ───┼────►│ PostgreSQL  │
+                                      │   = 1 conn pool ───┼────►│ PostgreSQL  │
+                                      │                    │     │  or MySQL   │
                                       │                    │     └─────────────┘
                                       │ stream closes      │
                                       │   → pool destroyed │
@@ -69,8 +70,8 @@ Ships as **one static binary** with no runtime dependencies, run under systemd.
 | `cmd/mcp-proxy` | Entrypoint, HTTP server, two-phase graceful shutdown |
 | `internal/config` | Environment config with safe fallbacks |
 | `internal/logging` | Structured JSON logging to **stderr only** |
-| `internal/dbconn` | Header → credentials → DSN; per-stream pool lifecycle |
-| `internal/guard` | SQL screening (comment/literal-aware) |
+| `internal/dbconn` | Header → credentials → DSN; engine adapters; pool lifecycle |
+| `internal/guard` | SQL command policy (comment/literal-aware) |
 | `internal/serialize` | The three-tier response matrix |
 | `internal/mcpsrv` | MCP tool surface, query execution |
 | `internal/httpapi` | Router, middleware, SSE wiring |
@@ -117,6 +118,7 @@ curl -sN -H 'x-db-username: postgres' -H 'x-db-password: secret' \
     "postgres-proxy": {
       "url": "https://dbmcp.hookman.online/v1/mcp/connect",
       "headers": {
+        "x-db-type": "postgres",
         "x-db-username": "app_reader",
         "x-db-password": "REPLACE_ME",
         "x-db-host": "db.example.com",
@@ -142,6 +144,7 @@ the `mcp-remote` bridge:
       "args": [
         "-y", "mcp-remote",
         "https://dbmcp.hookman.online/v1/mcp/connect",
+        "--header", "x-db-type:postgres",
         "--header", "x-db-username:app_reader",
         "--header", "x-db-password:REPLACE_ME",
         "--header", "x-db-host:db.example.com",
@@ -158,12 +161,23 @@ the `mcp-remote` bridge:
 
 | Header | Required | Default |
 |---|---|---|
+| `x-db-type` | no | `postgres` (`MCP_DEFAULT_DB_TYPE`) |
 | `x-db-username` | yes | — |
 | `x-db-password` | yes (may be empty for `trust`/`peer` auth) | — |
 | `x-db-host` | yes | — |
 | `x-db-port` | yes | — |
 | `x-db-database` | no | `postgres` |
 | `x-db-sslmode` | no | `prefer` |
+
+`x-db-type` accepts `postgres`, `postgresql`, `pg`, `mysql` or `mariadb`. The
+conventional port is 5432 for PostgreSQL and 3306 for MySQL, but `x-db-port` is
+mandatory either way — the server never guesses where a database lives.
+
+`x-db-sslmode` uses libpq vocabulary for **both** engines, so one client
+configuration works unchanged against either. For MySQL it is translated to the
+driver's TLS setting: `disable`→off, `allow`/`prefer`→preferred,
+`require`→encrypted without certificate validation, `verify-ca`/`verify-full`→
+full certificate and hostname validation.
 
 Credentials are used in request scope and never logged, cached or persisted.
 Logs carry a non-reversible `fingerprint` derived from user/host/port/database —
@@ -173,7 +187,7 @@ never the password — so you can correlate a tenant's lines without exposing th
 
 | Tool | Purpose |
 |---|---|
-| `execute_query` | Run one read-only statement |
+| `execute_query` | Run one SQL statement (see the command policy below) |
 | `list_tables` | Tables and views, optionally filtered by schema |
 | `describe_table` | Columns, types, nullability, defaults |
 | `ping_database` | Verify credentials and report server version |
@@ -234,13 +248,68 @@ Design decisions worth knowing:
 
 ## Safety model
 
-**Stated plainly: the keyword scanner is a guardrail, not a security boundary.**
-It stops a confused model from issuing a destructive statement by accident. It
-cannot stop a determined adversary, because SQL has too many ways to express the
-same intent.
+### Command policy
 
-**The real boundary is the privileges of the role in `x-db-username`.** Give it
-`SELECT` and nothing else:
+Statements are screened by an **allowlist of leading command keywords**, not a
+blocklist of substrings. Anything not explicitly permitted is refused, so a
+command nobody thought to list cannot slip through.
+
+| | Commands |
+|---|---|
+| **Permitted** | `SELECT` `INSERT` `UPDATE` `DELETE` `REPLACE` `MERGE` `WITH` `SHOW` `EXPLAIN` `CALL` |
+| **Refused** | `DROP` `TRUNCATE` `ALTER` `CREATE` `RENAME` `GRANT` `REVOKE` `VACUUM` `ANALYZE` `OPTIMIZE` `KILL` `SHUTDOWN` `SET` |
+
+Clause keywords — `JOIN` and its variants, `ON`, `USING`, `AS`, `WHERE`,
+`GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, `UNION`, `UNION ALL`,
+`INTERSECT`, `EXCEPT` — cannot begin a statement, so they are permitted
+implicitly wherever they appear inside one of the commands above.
+
+**Keywords only count in leading position**, which is the point of the design
+and what a substring blocklist gets wrong:
+
+```sql
+UPDATE users SET name = 'bob'     -- allowed: SET is a clause of UPDATE
+SET autocommit = 0                -- refused: SET as a command
+EXPLAIN ANALYZE SELECT * FROM t   -- allowed: ANALYZE means "actually run it"
+ANALYZE users                     -- refused: ANALYZE as a command
+INSERT INTO archive SELECT * FROM t  -- allowed
+SELECT * INTO archive FROM t         -- refused: that is CREATE TABLE in disguise
+```
+
+Comments, string literals, quoted identifiers (`"..."`, `` `...` ``) and
+dollar-quoted bodies are stripped before matching, so `DROP/**/TABLE x` is
+caught while `SELECT 'drop table x'` and a column named `vacuum_log` are not.
+Stacked statements (`SELECT 1; DROP TABLE x`) are refused outright, which is
+what makes judging only the leading keyword sufficient.
+
+A permitted command can still carry a forbidden construct, so these are
+refused inside otherwise-valid statements: `INTO OUTFILE`/`INTO DUMPFILE`,
+`load_file()`, `pg_read_file()`/`pg_ls_dir()`, `lo_import`/`lo_export`,
+`pg_terminate_backend()`, and `COPY ... PROGRAM`.
+
+Set `MCP_ALLOW_WRITES=false` to withdraw `INSERT`, `UPDATE`, `DELETE`,
+`REPLACE` and `MERGE` for a query-only deployment.
+
+### What this does and does not protect
+
+**Stated plainly: the guard is a guardrail, not a security boundary.** It stops
+a confused model from issuing a destructive statement by accident. It cannot
+stop a determined adversary, because SQL has too many ways to express the same
+intent.
+
+**Two specific limits worth internalising:**
+
+- **`CALL` is a large trust grant.** A stored procedure can do anything its
+  definer permits — including everything on the refused list — and the scanner
+  cannot see inside it. If that is not acceptable, add `\bCALL\b` to
+  `MCP_EXTRA_BLOCKED_PATTERNS`.
+- **Writes are permitted by default.** `INSERT`, `UPDATE` and `DELETE` with a
+  wrong or missing `WHERE` clause are destructive, and no guardrail can tell
+  an intended `DELETE` from a mistaken one.
+
+**The real boundary is the privileges of the role in `x-db-username`.**
+
+PostgreSQL, read-only:
 
 ```sql
 CREATE ROLE app_reader LOGIN PASSWORD 'REPLACE_ME';
@@ -250,28 +319,24 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_reader;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app_reader;
 ```
 
-Then set `MCP_READ_ONLY_TX=true`, which wraps every statement in a `READ ONLY`
-transaction — enforced by PostgreSQL itself, not by pattern matching.
+MySQL, read-only:
 
-What the scanner does buy over a naive `strings.Contains`:
+```sql
+CREATE USER 'app_reader'@'%' IDENTIFIED BY 'REPLACE_ME';
+GRANT SELECT ON appdb.* TO 'app_reader'@'%';
+```
 
-- Comments are replaced by whitespace *before* matching — the same thing
-  PostgreSQL's lexer does — so `DROP/**/DATABASE x` is caught.
-- String literals, quoted identifiers and dollar-quoted bodies are stripped, so
-  `SELECT 'drop database x'` and a column named `vacuum_log` do **not** false
-  positive.
-- Stacked statements (`SELECT 1; DROP DATABASE x`) are rejected outright.
+Grant `INSERT`, `UPDATE` and `DELETE` on specific tables only where a client
+genuinely needs them.
 
-Blocked by default: `DROP DATABASE`/`SCHEMA`/`TABLESPACE`/`ROLE`/`OWNED`,
-`VACUUM`, `TRUNCATE`, `ALTER SYSTEM`, `REINDEX`, `CLUSTER`, `COPY … PROGRAM`
-(shell execution on the DB host), `pg_read_file`/`pg_ls_dir`, `lo_import`/
-`lo_export`, `pg_terminate_backend`, `LANGUAGE C` functions, and anonymous
-`DO` blocks. Extend with `MCP_EXTRA_BLOCKED_PATTERNS`.
+### Other protections
 
-Other protections:
-
-- **Credentials cannot restructure the DSN.** It is assembled with `net/url`, so
-  a password containing `@ : / ? #` is escaped rather than reinterpreted.
+- **Credentials cannot restructure the connection string.** The PostgreSQL DSN
+  is assembled with `net/url` and the MySQL DSN through `mysql.Config.FormatDSN`,
+  so a password containing `@ : / ? #` is escaped rather than reinterpreted.
+- **MySQL `multiStatements` and `allowAllFiles` are forced off.** The first
+  would let a second statement past the stacked-statement check; the second
+  would let `LOAD DATA LOCAL INFILE` read this proxy's own filesystem.
 - **Link-local addresses are always refused**, because `169.254.169.254` is the
   cloud instance-metadata endpoint and no legitimate database lives there.
   `MCP_BLOCK_PRIVATE_HOSTS=true` additionally refuses loopback and RFC1918,
@@ -296,6 +361,7 @@ from booting.
 | `MCP_JSON_MAX_ROWS` | `100` | Tier 1 ceiling |
 | `MCP_CSV_MAX_ROWS` | `2000` | Tier 2 ceiling / truncation point |
 | `MCP_MAX_RESULT_BYTES` | `33554432` | Independent byte ceiling (32 MB) |
+| `MCP_DEFAULT_DB_TYPE` | `postgres` | Engine used when `x-db-type` is absent |
 | `MCP_DEFAULT_DATABASE` | `postgres` | Default for `x-db-database` |
 | `MCP_DEFAULT_SSLMODE` | `prefer` | Default for `x-db-sslmode` |
 | `MCP_QUERY_TIMEOUT_MS` | `30000` | Per-statement deadline |
@@ -303,7 +369,7 @@ from booting.
 | `MCP_POOL_MAX_CONNS` | `4` | Connections **per stream** |
 | `MCP_POOL_MAX_CONN_IDLE_MS` | `60000` | Idle connection reaping |
 | `MCP_POOL_MAX_CONN_LIFETIME_MS` | `1800000` | Connection recycling |
-| `MCP_READ_ONLY_TX` | `false` | Wrap statements in `READ ONLY` transactions |
+| `MCP_ALLOW_WRITES` | `true` | Keep INSERT/UPDATE/DELETE/REPLACE/MERGE permitted |
 | `MCP_BLOCK_PRIVATE_HOSTS` | `false` | Refuse loopback/RFC1918 targets |
 | `MCP_EXTRA_BLOCKED_PATTERNS` | — | Comma-separated extra regexes |
 | `MCP_DISABLE_LOCALHOST_PROTECTION` | `false` | **Required behind a reverse proxy** — see below |
@@ -572,14 +638,21 @@ NULL vs empty string), JSON column ordering and numeric precision, guard
 evasion and false-positive cases, header validation and DSN escaping, credential
 redaction, and the full SSE handshake including stream teardown.
 
-### End-to-end against a real PostgreSQL
+### End-to-end against a real database
 
 `test/e2e_test.go` drives the actual MCP protocol — SSE transport, `initialize`,
-`tools/call` — against a live database. It **skips** unless `DBMCP_E2E_DSN` is
-set:
+`tools/call` — against a live server. It is engine-aware: the DSN scheme selects
+the engine and the per-engine SQL. It **skips** unless `DBMCP_E2E_DSN` is set.
+
+MySQL / MariaDB:
 
 ```bash
-# any disposable PostgreSQL will do
+DBMCP_E2E_DSN='mysql://root@127.0.0.1:3306/information_schema' go test ./test/... -v
+```
+
+PostgreSQL:
+
+```bash
 docker run -d --name dbmcp-pg -e POSTGRES_PASSWORD=secret \
   -e POSTGRES_DB=appdb -p 55432:5432 postgres:16-alpine
 
@@ -587,5 +660,6 @@ DBMCP_E2E_DSN='postgres://postgres:secret@127.0.0.1:55432/appdb?sslmode=disable'
   go test ./test/... -v
 ```
 
-Docker here is purely a convenience for a throwaway test database on a developer
-machine. It is not a dependency of the service and plays no part in deployment.
+The suite only reads, so it is safe against an existing development database.
+Docker above is purely a convenience for a throwaway PostgreSQL on a developer
+machine; it is not a dependency of the service and plays no part in deployment.

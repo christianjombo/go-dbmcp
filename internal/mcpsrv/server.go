@@ -7,11 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/christianjombo/go-dbmcp/internal/config"
@@ -19,11 +19,6 @@ import (
 	"github.com/christianjombo/go-dbmcp/internal/guard"
 	"github.com/christianjombo/go-dbmcp/internal/serialize"
 )
-
-// typeNames resolves PostgreSQL OIDs to readable type names for the result
-// metadata block. It is written once at init and only read afterwards, so it
-// is safe to share across every concurrent session.
-var typeNames = pgtype.NewMap()
 
 // Deps are the process-wide collaborators shared by every session.
 type Deps struct {
@@ -41,41 +36,20 @@ type handlers struct {
 // per live SSE stream.
 func New(d Deps, sess *dbconn.Session) *mcp.Server {
 	h := &handlers{Deps: d, sess: sess}
+	engine := sess.Credentials().Engine
 
 	srv := mcp.NewServer(
 		&mcp.Implementation{
 			Name:    "mcp-proxy",
-			Title:   "PostgreSQL MCP Proxy",
+			Title:   "SQL MCP Proxy",
 			Version: d.Cfg.Version,
 		},
-		&mcp.ServerOptions{
-			Instructions: fmt.Sprintf(
-				"Read-oriented access to a PostgreSQL database.\n\n"+
-					"Results are returned in one of three formats, and the first line of every "+
-					"response declares which:\n"+
-					"  - up to %d rows: `Format: application/json`\n"+
-					"  - up to %d rows: `Format: text/csv` (denser; the header row names the columns)\n"+
-					"  - beyond that:   `Format: text/csv`, truncated, with an explicit TRUNCATION WARNING.\n\n"+
-					"In CSV, SQL NULL is written as %s and an empty field is a genuine empty string.\n"+
-					"If a response carries a truncation warning, the rows you received are a prefix of the "+
-					"result set, not the whole of it — never compute totals or extremes from them.\n"+
-					"Destructive and maintenance statements are refused by a server-side guardrail.",
-				d.Cfg.JSONMaxRows, d.Cfg.CSVMaxRows, serialize.NullToken),
-		},
+		&mcp.ServerOptions{Instructions: instructions(d.Cfg, engine)},
 	)
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name: "execute_query",
-		Description: fmt.Sprintf(
-			"Run a single read-only SQL statement against the connected PostgreSQL database and "+
-				"return the rows.\n\n"+
-				"Pass exactly one statement; stacked statements separated by ';' are refused. "+
-				"Destructive and maintenance commands (DROP DATABASE, TRUNCATE, VACUUM, ALTER SYSTEM "+
-				"and similar) are refused before reaching the database.\n\n"+
-				"Large results are automatically compacted: at most %d rows come back as JSON, larger "+
-				"results come back as CSV, and anything beyond %d rows is truncated with a warning. "+
-				"Prefer an explicit LIMIT, or an aggregate such as COUNT(*), when you only need a summary.",
-			d.Cfg.JSONMaxRows, d.Cfg.CSVMaxRows),
+		Name:        "execute_query",
+		Description: executeQueryDescription(d.Cfg, engine),
 	}, h.executeQuery)
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -92,75 +66,134 @@ func New(d Deps, sess *dbconn.Session) *mcp.Server {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ping_database",
-		Description: "Verify that the credentials supplied in the x-db-* request headers can actually " +
-			"reach the database, and report the server version. Use this first when a query fails " +
-			"with a connection error.",
+		Description: "Verify that the credentials supplied in the x-db-* request headers can reach the " +
+			"database, and report the server version. Use this first when a query fails with a " +
+			"connection error.",
 	}, h.pingDatabase)
 
 	return srv
+}
+
+func instructions(cfg *config.Config, engine dbconn.Engine) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "Access to a %s database.\n\n", engineLabel(engine))
+
+	b.WriteString("Results come back in one of three formats, and the first line of every response " +
+		"declares which:\n")
+	fmt.Fprintf(&b, "  - up to %d rows: `Format: application/json`\n", cfg.JSONMaxRows)
+	fmt.Fprintf(&b, "  - up to %d rows: `Format: text/csv` (denser; the header row names the columns)\n", cfg.CSVMaxRows)
+	b.WriteString("  - beyond that:   `Format: text/csv`, truncated, with an explicit TRUNCATION WARNING.\n\n")
+
+	fmt.Fprintf(&b, "In CSV, SQL NULL is written as %s and an empty field is a genuine empty string.\n",
+		serialize.NullToken)
+	b.WriteString("If a response carries a truncation warning, the rows you received are a prefix of the " +
+		"result set, not the whole of it — never compute totals or extremes from them.\n\n")
+
+	fmt.Fprintf(&b, "Permitted statements: %s.\n", commandList())
+	if !cfg.AllowWrites {
+		b.WriteString("This server is configured read-only, so INSERT, UPDATE, DELETE, REPLACE and " +
+			"MERGE are refused.\n")
+	}
+	b.WriteString("Schema and administrative commands (DROP, CREATE, ALTER, TRUNCATE, GRANT and the " +
+		"like) are refused by a server-side guardrail.\n")
+
+	if engine == dbconn.EngineMySQL {
+		b.WriteString("\nThis is MySQL: use backticks for quoted identifiers, LIMIT n OFFSET m for " +
+			"paging, and SHOW TABLES / SHOW COLUMNS for schema inspection.\n")
+	} else {
+		b.WriteString("\nThis is PostgreSQL: use double quotes for quoted identifiers, $1-style " +
+			"placeholders, and ILIKE for case-insensitive matching.\n")
+	}
+	return b.String()
+}
+
+func executeQueryDescription(cfg *config.Config, engine dbconn.Engine) string {
+	write := "Data-modifying statements (INSERT, UPDATE, DELETE, REPLACE, MERGE) are permitted"
+	if !cfg.AllowWrites {
+		write = "This server is read-only, so data-modifying statements are refused"
+	}
+	return fmt.Sprintf(
+		"Run a single SQL statement against the connected %s database.\n\n"+
+			"Pass exactly one statement; stacked statements separated by ';' are refused. "+
+			"%s. Schema and administrative commands are refused.\n\n"+
+			"Large results are compacted automatically: at most %d rows return as JSON, larger results "+
+			"return as CSV, and anything beyond %d rows is truncated with a warning. Prefer an explicit "+
+			"LIMIT, or an aggregate such as COUNT(*), when you only need a summary.",
+		engineLabel(engine), write, cfg.JSONMaxRows, cfg.CSVMaxRows)
+}
+
+func engineLabel(e dbconn.Engine) string {
+	if e == dbconn.EngineMySQL {
+		return "MySQL/MariaDB"
+	}
+	return "PostgreSQL"
+}
+
+func commandList() string {
+	names := make([]string, 0, len(guard.AllowedCommands))
+	for k := range guard.AllowedCommands {
+		names = append(names, k)
+	}
+	// Presentation order: read, write, then inspection.
+	order := []string{"SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "REPLACE", "MERGE", "SHOW", "EXPLAIN", "CALL"}
+	out := make([]string, 0, len(order))
+	for _, o := range order {
+		if _, ok := guard.AllowedCommands[o]; ok {
+			out = append(out, o)
+		}
+	}
+	return strings.Join(out, ", ")
 }
 
 // ---------------------------------------------------------------- tool input
 
 // ExecuteQueryInput is the argument schema for execute_query.
 type ExecuteQueryInput struct {
-	SQL string `json:"sql" jsonschema:"The SQL statement to execute. Exactly one statement, no trailing second statement."`
+	SQL string `json:"sql" jsonschema:"The SQL statement to execute. Exactly one statement, with no trailing second statement."`
 }
 
 // ListTablesInput is the argument schema for list_tables.
 type ListTablesInput struct {
-	Schema string `json:"schema,omitempty" jsonschema:"Optional schema to restrict the listing to. Omit to list every non-system schema."`
+	Schema string `json:"schema,omitempty" jsonschema:"Optional schema or database to restrict the listing to. Omit to list every non-system schema."`
 }
 
 // DescribeTableInput is the argument schema for describe_table.
 type DescribeTableInput struct {
 	Table  string `json:"table" jsonschema:"Name of the table or view to describe, without the schema prefix."`
-	Schema string `json:"schema,omitempty" jsonschema:"Optional schema containing the table. Omit to search every non-system schema."`
+	Schema string `json:"schema,omitempty" jsonschema:"Optional schema or database containing the table. Omit to search every non-system schema."`
 }
 
 // -------------------------------------------------------------- tool handlers
 
 func (h *handlers) executeQuery(ctx context.Context, _ *mcp.CallToolRequest, in ExecuteQueryInput) (*mcp.CallToolResult, any, error) {
-	if decision := h.Scanner.Inspect(in.SQL); !decision.Allowed {
+	decision := h.Scanner.Inspect(in.SQL)
+	if !decision.Allowed {
 		h.Log.Warn("statement refused by guardrail",
 			"rule", decision.RuleID,
+			"command", decision.Command,
+			"engine", string(h.sess.Credentials().Engine),
 			"fingerprint", h.sess.Credentials().Fingerprint())
 		return errorResult(guard.BlockMessage(decision)), nil, nil
 	}
-	return h.run(ctx, in.SQL, nil)
+
+	return h.run(ctx, dbconn.Statement{SQL: in.SQL, Command: decision.Command})
 }
 
 func (h *handlers) listTables(ctx context.Context, _ *mcp.CallToolRequest, in ListTablesInput) (*mcp.CallToolResult, any, error) {
-	const q = `
-		SELECT table_schema AS schema,
-		       table_name   AS name,
-		       lower(table_type) AS kind
-		  FROM information_schema.tables
-		 WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-		   AND ($1::text IS NULL OR table_schema = $1::text)
-		 ORDER BY 1, 2`
-	return h.run(ctx, q, []any{nullIfEmpty(in.Schema)})
+	return h.run(ctx, h.sess.Credentials().ListTablesStatement(in.Schema))
 }
 
 func (h *handlers) describeTable(ctx context.Context, _ *mcp.CallToolRequest, in DescribeTableInput) (*mcp.CallToolResult, any, error) {
-	if in.Table == "" {
+	if strings.TrimSpace(in.Table) == "" {
 		return errorResult("The `table` argument is required and must not be empty."), nil, nil
 	}
-	const q = `
-		SELECT table_schema    AS schema,
-		       table_name      AS "table",
-		       column_name     AS column,
-		       data_type       AS type,
-		       is_nullable     AS nullable,
-		       column_default  AS "default"
-		  FROM information_schema.columns
-		 WHERE table_name = $1::text
-		   AND ($2::text IS NULL OR table_schema = $2::text)
-		 ORDER BY table_schema, ordinal_position`
-	return h.run(ctx, q, []any{in.Table, nullIfEmpty(in.Schema)})
+	return h.run(ctx, h.sess.Credentials().DescribeTableStatement(in.Table, in.Schema))
 }
 
 func (h *handlers) pingDatabase(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+	creds := h.sess.Credentials()
+
 	pool, err := h.sess.Acquire(ctx)
 	if err != nil {
 		return errorResult(connectionMessage(err)), nil, nil
@@ -169,81 +202,71 @@ func (h *handlers) pingDatabase(ctx context.Context, _ *mcp.CallToolRequest, _ s
 	qctx, cancel := h.sess.QueryContext(ctx, h.Cfg.QueryTimeout)
 	defer cancel()
 
-	var version, database, user string
-	err = pool.QueryRow(qctx, "SELECT version(), current_database(), current_user").
-		Scan(&version, &database, &user)
-	if err != nil {
-		return errorResult(queryErrorMessage(err)), nil, nil
-	}
-
-	return textResult(fmt.Sprintf(
-		"✅ Connection OK\n\nTarget:   %s\nUser:     %s\nDatabase: %s\nVersion:  %s\n",
-		h.sess.Credentials().Target(), user, database, version)), nil, nil
-}
-
-// --------------------------------------------------------------- query engine
-
-// querier is satisfied by both *pgxpool.Pool and pgx.Tx.
-type querier interface {
-	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
-}
-
-// run executes one statement and renders the result through the tier matrix.
-// It never returns a non-nil error for a tenant-caused failure: those come
-// back as tool errors so the model can read the message and correct itself,
-// rather than as protocol errors that abort the call.
-func (h *handlers) run(ctx context.Context, sqlText string, args []any) (*mcp.CallToolResult, any, error) {
-	pool, err := h.sess.Acquire(ctx)
-	if err != nil {
-		return errorResult(connectionMessage(err)), nil, nil
-	}
-
-	qctx, cancel := h.sess.QueryContext(ctx, h.Cfg.QueryTimeout)
-	defer cancel()
-
-	var q querier = pool
-
-	if h.Cfg.ReadOnlyTx {
-		tx, err := pool.BeginTx(qctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
-		if err != nil {
-			return errorResult(queryErrorMessage(err)), nil, nil
-		}
-		defer func() {
-			// The query context may already be cancelled or past its
-			// deadline; roll back on a detached one so the transaction is
-			// always released rather than left for the pool to reap.
-			rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-			defer rcancel()
-			_ = tx.Rollback(rctx)
-		}()
-		q = tx
-	}
-
-	start := time.Now()
-
-	// pgx.QueryResultFormats forces every column into PostgreSQL's text
-	// representation. For a generic proxy that is exactly what we want: uuid,
-	// numeric, arrays, ranges, enums and extension types all render the way
-	// the server renders them, with no client-side type table to maintain and
-	// no numeric silently routed through a float64.
-	callArgs := make([]any, 0, len(args)+1)
-	callArgs = append(callArgs, pgx.QueryResultFormats{pgx.TextFormatCode})
-	callArgs = append(callArgs, args...)
-
-	rows, err := q.Query(qctx, sqlText, callArgs...)
+	rows, err := pool.Query(qctx, creds.ServerInfoStatement())
 	if err != nil {
 		return errorResult(queryErrorMessage(err)), nil, nil
 	}
 	defer rows.Close()
 
-	fds := rows.FieldDescriptions()
-	cols := make([]serialize.Column, len(fds))
-	for i, fd := range fds {
-		cols[i] = serialize.Column{
-			Name:     fd.Name,
-			OID:      fd.DataTypeOID,
-			TypeName: typeNameFor(fd.DataTypeOID),
+	var version, database, who string
+	if rows.Next() {
+		v := rows.Values()
+		get := func(i int) string {
+			if i < len(v) && v[i] != nil {
+				return string(v[i])
+			}
+			return "(none)"
 		}
+		version, database, who = get(0), get(1), get(2)
+	}
+	if err := rows.Err(); err != nil {
+		return errorResult(queryErrorMessage(err)), nil, nil
+	}
+
+	return textResult(fmt.Sprintf(
+		"✅ Connection OK\n\nEngine:   %s\nTarget:   %s\nUser:     %s\nDatabase: %s\nVersion:  %s\n",
+		engineLabel(creds.Engine), creds.Target(), who, database, version)), nil, nil
+}
+
+// --------------------------------------------------------------- query engine
+
+// run executes one statement and renders the result through the tier matrix.
+// It never returns a non-nil error for a tenant-caused failure: those come
+// back as tool errors so the model can read the message and correct itself,
+// rather than as protocol errors that abort the call.
+func (h *handlers) run(ctx context.Context, st dbconn.Statement) (*mcp.CallToolResult, any, error) {
+	pool, err := h.sess.Acquire(ctx)
+	if err != nil {
+		return errorResult(connectionMessage(err)), nil, nil
+	}
+
+	qctx, cancel := h.sess.QueryContext(ctx, h.Cfg.QueryTimeout)
+	defer cancel()
+
+	start := time.Now()
+
+	rows, err := pool.Query(qctx, st)
+	if err != nil {
+		return errorResult(queryErrorMessage(err)), nil, nil
+	}
+	defer rows.Close()
+
+	cols := rows.Columns()
+
+	// A statement with no result set (an INSERT/UPDATE/DELETE without
+	// RETURNING) reports its tag and affected-row count instead of rows.
+	if len(cols) == 0 {
+		// Drain so the driver can report the command tag.
+		for rows.Next() {
+		}
+		if err := rows.Err(); err != nil {
+			return errorResult(queryErrorMessage(err)), nil, nil
+		}
+		tag, affected := rows.Command()
+		if tag == "" {
+			tag = st.Command
+		}
+		return textResult(serialize.Command(tag, affected, time.Since(start)).Text), nil, nil
 	}
 
 	// Read one row beyond the CSV ceiling: that extra row is what proves more
@@ -255,17 +278,8 @@ func (h *handlers) run(ctx context.Context, sqlText string, args []any) (*mcp.Ca
 	byteCapped := false
 
 	for rows.Next() {
-		raw := rows.RawValues()
-		// RawValues aliases the connection's read buffer and is invalidated
-		// by the next Next(), so every non-NULL value must be copied.
-		row := make(serialize.Row, len(raw))
-		for i, v := range raw {
-			if v == nil {
-				continue // nil stays nil: this is what distinguishes NULL from ''
-			}
-			row[i] = append([]byte(nil), v...)
-			used += len(v)
-		}
+		row, n := copyRow(rows.Values())
+		used += n
 		collected = append(collected, row)
 
 		if used >= byteBudget {
@@ -279,13 +293,6 @@ func (h *handlers) run(ctx context.Context, sqlText string, args []any) (*mcp.Ca
 
 	if err := rows.Err(); err != nil {
 		return errorResult(queryErrorMessage(err)), nil, nil
-	}
-
-	// A statement with no result set (INSERT/UPDATE/DDL) reports its tag.
-	if len(cols) == 0 {
-		tag := rows.CommandTag()
-		rows.Close()
-		return textResult(serialize.Command(tag.String(), tag.RowsAffected(), time.Since(start)).Text), nil, nil
 	}
 
 	result, err := serialize.Rows(cols, collected, serialize.Options{
@@ -302,6 +309,8 @@ func (h *handlers) run(ctx context.Context, sqlText string, args []any) (*mcp.Ca
 	}
 
 	h.Log.Debug("query complete",
+		"engine", string(h.sess.Credentials().Engine),
+		"command", st.Command,
 		"tier", result.Tier,
 		"rows", result.RowsShown,
 		"truncated", result.Truncated,
@@ -313,18 +322,27 @@ func (h *handlers) run(ctx context.Context, sqlText string, args []any) (*mcp.Ca
 
 // ------------------------------------------------------------------- helpers
 
-func typeNameFor(oid uint32) string {
-	if t, ok := typeNames.TypeForOID(oid); ok {
-		return t.Name
+// copyRow detaches one row from the driver's read buffer, which the next
+// call to Next may overwrite. It returns the copy and the bytes consumed.
+//
+// The empty-slice handling is load-bearing and easy to get wrong:
+// `append([]byte(nil), v...)` returns nil when v is empty, which would turn
+// every empty string into a SQL NULL by the time it reached the CSV encoder.
+// make+copy always yields a non-nil slice, so NULL (nil) and ” (non-nil,
+// length zero) stay distinct all the way out.
+func copyRow(raw [][]byte) (serialize.Row, int) {
+	row := make(serialize.Row, len(raw))
+	used := 0
+	for i, v := range raw {
+		if v == nil {
+			continue // nil stays nil: this is what distinguishes NULL from ''
+		}
+		cp := make([]byte, len(v))
+		copy(cp, v)
+		row[i] = cp
+		used += len(v)
 	}
-	return ""
-}
-
-func nullIfEmpty(s string) any {
-	if s == "" {
-		return nil
-	}
-	return s
+	return row, used
 }
 
 func textResult(text string) *mcp.CallToolResult {
@@ -345,13 +363,13 @@ func connectionMessage(err error) string {
 	}
 	return fmt.Sprintf(
 		"❌ COULD NOT CONNECT TO THE DATABASE\n\n%v\n\n"+
-			"Check the x-db-host, x-db-port, x-db-username, x-db-password and x-db-sslmode "+
-			"headers in the MCP client configuration. Run ping_database to retest.", err)
+			"Check the x-db-type, x-db-host, x-db-port, x-db-username, x-db-password and "+
+			"x-db-sslmode headers in the MCP client configuration. Run ping_database to retest.", err)
 }
 
-// queryErrorMessage surfaces PostgreSQL's own diagnostics. SQLSTATE, hint and
-// position are precisely what lets a model repair its own query instead of
-// guessing, so they are passed through rather than flattened.
+// queryErrorMessage surfaces the server's own diagnostics. The error code,
+// hint and position are precisely what lets a model repair its own query
+// instead of guessing, so they are passed through rather than flattened.
 func queryErrorMessage(err error) string {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "⏱️ QUERY TIMED OUT\n\nThe statement exceeded the server's query timeout and was cancelled. " +
@@ -374,6 +392,12 @@ func queryErrorMessage(err error) string {
 			msg += fmt.Sprintf("\nPosition: character %d of the statement", pgErr.Position)
 		}
 		return msg
+	}
+
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) {
+		return fmt.Sprintf("❌ SQL ERROR\n\nError:   %d\nSQLSTATE: %s\nMessage: %s",
+			myErr.Number, string(myErr.SQLState[:]), myErr.Message)
 	}
 
 	return fmt.Sprintf("❌ QUERY FAILED\n\n%v", err)

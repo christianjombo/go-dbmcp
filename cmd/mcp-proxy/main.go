@@ -56,7 +56,7 @@ func run() error {
 		log.Warn("configuration fallback applied", "detail", w)
 	}
 
-	scanner, guardWarnings := guard.New(cfg.ExtraBlockedPatterns)
+	scanner, guardWarnings := guard.New(cfg.ExtraBlockedPatterns, cfg.AllowWrites)
 	for _, w := range guardWarnings {
 		log.Warn("guardrail configuration problem", "detail", w)
 	}
