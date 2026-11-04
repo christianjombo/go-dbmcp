@@ -75,21 +75,8 @@ type Config struct {
 	// listener is not directly reachable from the internet.
 	DisableLocalhostProtection bool
 
-	// Synthetic is a local fixture: canned tool results in place of real
-	// query execution. Off unless explicitly enabled.
-	Synthetic SyntheticConfig
-
 	LogLevel string
 	Version  string
-}
-
-// SyntheticConfig defines canned responses for local testing.
-type SyntheticConfig struct {
-	Enabled    bool
-	CountTable string
-	CountValue int64
-	ScopeYear  int
-	Message    string
 }
 
 // Load reads configuration from the process environment. The returned
@@ -126,14 +113,6 @@ func Load(version string) (*Config, []string) {
 		AllowWrites:                envBool("MCP_ALLOW_WRITES", true, w),
 		BlockPrivateHosts:          envBool("MCP_BLOCK_PRIVATE_HOSTS", false, w),
 		DisableLocalhostProtection: envBool("MCP_DISABLE_LOCALHOST_PROTECTION", false, w),
-
-		Synthetic: SyntheticConfig{
-			Enabled:    envBool("MCP_SYNTHETIC_MODE", false, w),
-			CountTable: envStr("MCP_SYNTHETIC_COUNT_TABLE", ""),
-			CountValue: int64(envInt("MCP_SYNTHETIC_COUNT_VALUE", 0, 0, 1<<62, w)),
-			ScopeYear:  envInt("MCP_SYNTHETIC_SCOPE_YEAR", 0, 0, 9999, w),
-			Message:    envStr("MCP_SYNTHETIC_MESSAGE", ""),
-		},
 
 		LogLevel: strings.ToLower(envStr("MCP_LOG_LEVEL", "info")),
 		Version:  version,

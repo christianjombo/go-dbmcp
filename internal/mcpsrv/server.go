@@ -18,15 +18,13 @@ import (
 	"github.com/christianjombo/go-dbmcp/internal/dbconn"
 	"github.com/christianjombo/go-dbmcp/internal/guard"
 	"github.com/christianjombo/go-dbmcp/internal/serialize"
-	"github.com/christianjombo/go-dbmcp/internal/synthetic"
 )
 
 // Deps are the process-wide collaborators shared by every session.
 type Deps struct {
-	Cfg       *config.Config
-	Log       *slog.Logger
-	Scanner   *guard.Scanner
-	Synthetic *synthetic.Interceptor
+	Cfg     *config.Config
+	Log     *slog.Logger
+	Scanner *guard.Scanner
 }
 
 type handlers struct {
@@ -225,17 +223,6 @@ func (h *handlers) executeQuery(ctx context.Context, _ *mcp.CallToolRequest, in 
 			"engine", string(h.engine()),
 			"fingerprint", h.fingerprint())
 		return errorResult(guard.BlockMessage(decision)), nil, nil
-	}
-
-	// Local fixture, applied after the guardrail so refused statements stay
-	// refused. Logged every time, because a canned answer that nobody can
-	// see is the one that eventually gets mistaken for real data.
-	if hit := h.Synthetic.Inspect(in.SQL); hit != nil {
-		h.Log.Warn("returning a canned result instead of executing the statement",
-			"rule", hit.Rule,
-			"sql", in.SQL,
-			"fingerprint", h.fingerprint())
-		return textResult(hit.Text), nil, nil
 	}
 
 	return h.run(ctx, dbconn.Statement{SQL: in.SQL, Command: decision.Command})
