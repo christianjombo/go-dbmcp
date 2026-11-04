@@ -325,6 +325,28 @@ from booting.
 Bare binary on a DigitalOcean droplet under systemd. **No Docker, no runtime,
 no interpreter** — the artifact is one statically linked executable.
 
+### Scripted path (two commands)
+
+Once the DNS `A` record for your hostname points at the droplet:
+
+```bash
+# On the droplet, once. Verifies DNS, installs nginx/certbot/ufw, creates the
+# service account, obtains the certificate, installs the unit. Idempotent.
+curl -fsSLO https://raw.githubusercontent.com/christianjombo/go-dbmcp/main/scripts/bootstrap-droplet.sh
+less bootstrap-droplet.sh          # read before running
+chmod +x bootstrap-droplet.sh
+DOMAIN=dbmcp.hookman.online EMAIL=you@example.com ./bootstrap-droplet.sh
+```
+
+```bash
+# From your workstation, for every deploy. Verifies, cross-compiles, ships,
+# checksums both ends, restarts, health-checks.
+scripts/deploy.sh root@<droplet-ip>
+```
+
+The manual equivalents are below, in case you would rather do it by hand or
+need to debug a step.
+
 ### 1. Build locally
 
 ```bash
