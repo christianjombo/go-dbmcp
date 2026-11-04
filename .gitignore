@@ -1,0 +1,18 @@
+# Build artefacts — the release binary is ~13MB and is produced by `make release`.
+/bin/
+*.exe
+*.test
+*.out
+
+# Local operator configuration. deploy/mcp-proxy.env.example IS tracked;
+# a real environment file carries tenant credentials and must never be.
+.env
+.env.*
+!.env.example
+mcp-proxy.env
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

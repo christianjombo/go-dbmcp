@@ -1,0 +1,118 @@
+; systemd unit for mcp-proxy — stateless multi-tenant MCP/SSE PostgreSQL proxy.
+;
+; Install:
+;   install -D -m 0755 bin/mcp-proxy-binary /opt/mcp-proxy/mcp-proxy-binary
+;   install -D -m 0644 deploy/mcp-proxy.service /etc/systemd/system/mcp-proxy.service
+;   install -d  -m 0750 /etc/mcp-proxy
+;   install -m 0640 deploy/mcp-proxy.env.example /etc/mcp-proxy/mcp-proxy.env
+;   useradd --system --no-create-home --shell /usr/sbin/nologin mcpproxy
+;   chown -R mcpproxy:mcpproxy /opt/mcp-proxy /etc/mcp-proxy
+;   systemctl daemon-reload && systemctl enable --now mcp-proxy
+
+[Unit]
+Description=MCP PostgreSQL Proxy (SSE transport)
+Documentation=https://modelcontextprotocol.io/specification/2024-11-05/basic/transports
+; network-online rather than plain network: the listener binds immediately and
+; we would rather fail visibly than bind before the interface is configured.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+; Type=exec reports the service started only once the binary has actually been
+; executed, which makes `systemctl start` failures surface immediately rather
+; than being reported as success.
+Type=exec
+User=mcpproxy
+Group=mcpproxy
+
+WorkingDirectory=/opt/mcp-proxy
+ExecStart=/opt/mcp-proxy/mcp-proxy-binary
+
+; Operator overrides live here and are not world-readable. The leading '-'
+; means the service still starts if the file is absent — every setting below
+; has a safe default in the binary.
+EnvironmentFile=-/etc/mcp-proxy/mcp-proxy.env
+
+; ----------------------------------------------------------------- defaults
+; These mirror the in-binary fallbacks and exist so an operator can see the
+; full surface in one place. Anything set in the EnvironmentFile wins.
+Environment=MCP_LISTEN_ADDR=:8080
+Environment=MCP_LOG_LEVEL=info
+
+; Serialization matrix (see internal/serialize).
+Environment=MCP_JSON_MAX_ROWS=100
+Environment=MCP_CSV_MAX_ROWS=2000
+
+; Defaults for the optional x-db-* headers.
+Environment=MCP_DEFAULT_DATABASE=postgres
+Environment=MCP_DEFAULT_SSLMODE=prefer
+
+; Per-tenant pool and query bounds.
+Environment=MCP_QUERY_TIMEOUT_MS=30000
+Environment=MCP_CONNECT_TIMEOUT_MS=10000
+Environment=MCP_POOL_MAX_CONNS=4
+Environment=MCP_MAX_RESULT_BYTES=33554432
+
+; This service terminates TLS at nginx on the same host, so every request
+; arrives from 127.0.0.1 with a public Host header. The SDK's DNS-rebinding
+; guard rejects exactly that pattern, so it must be disabled here — and the
+; listener must therefore NOT be publicly reachable. Bind to 127.0.0.1 in the
+; EnvironmentFile if the droplet has no firewall in front of it.
+Environment=MCP_DISABLE_LOCALHOST_PROTECTION=true
+
+; ------------------------------------------------------------- restart policy
+Restart=always
+RestartSec=2s
+; Give in-flight SSE streams time to drain. Must exceed MCP_SHUTDOWN_GRACE_MS
+; (default 15s) or systemd will SIGKILL mid-shutdown and leak tenant backends.
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+KillMode=mixed
+
+; Go writes structured JSON logs to stderr; journald captures them as-is.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-proxy
+
+; ----------------------------------------------------------------- hardening
+; This process proxies arbitrary credentials to arbitrary hosts, so it is
+; given the smallest surface that still lets it open outbound TCP sockets.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+; Outbound TCP to tenant databases plus the listening socket. Nothing else.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+; The binary needs no capabilities: it binds 8080, not a privileged port. To
+; bind :80 or :443 directly, add AmbientCapabilities=CAP_NET_BIND_SERVICE and
+; CapabilityBoundingSet=CAP_NET_BIND_SERVICE instead of leaving these empty.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+; ------------------------------------------------------------ resource limits
+; Each SSE stream is one inbound socket plus up to MCP_POOL_MAX_CONNS outbound
+; ones, so the file-descriptor ceiling is what actually caps concurrency.
+LimitNOFILE=65535
+TasksMax=4096
+; Uncomment to make the OOM killer's choice predictable on a small droplet.
+; MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
