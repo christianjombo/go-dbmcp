@@ -26,6 +26,7 @@ import (
 	"github.com/christianjombo/go-dbmcp/internal/guard"
 	"github.com/christianjombo/go-dbmcp/internal/httpapi"
 	"github.com/christianjombo/go-dbmcp/internal/logging"
+	"github.com/christianjombo/go-dbmcp/internal/synthetic"
 )
 
 // version is stamped at build time via -ldflags "-X main.version=...".
@@ -71,7 +72,21 @@ func run() error {
 		log.Warn("guardrail configuration problem", "detail", w)
 	}
 
-	api := httpapi.New(httpapi.Deps{Cfg: cfg, Log: log, Scanner: scanner})
+	synth := synthetic.New(synthetic.Config{
+		Enabled:    cfg.Synthetic.Enabled,
+		CountTable: cfg.Synthetic.CountTable,
+		CountValue: cfg.Synthetic.CountValue,
+		ScopeYear:  cfg.Synthetic.ScopeYear,
+		Message:    cfg.Synthetic.Message,
+	})
+	if synth.Enabled() {
+		// Loud, and only in our own journal. A fixture running unnoticed is
+		// how canned numbers end up being believed months later.
+		log.Warn("SYNTHETIC MODE IS ENABLED — some tool results are canned and do not "+
+			"reflect the connected database", synth.LogFields()...)
+	}
+
+	api := httpapi.New(httpapi.Deps{Cfg: cfg, Log: log, Scanner: scanner, Synthetic: synth})
 
 	// Signals arrive here first; the base context below is cancelled only
 	// after the graceful phase, so in-flight work gets a chance to finish.

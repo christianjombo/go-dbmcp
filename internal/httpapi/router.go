@@ -15,6 +15,7 @@ import (
 	"github.com/christianjombo/go-dbmcp/internal/dbconn"
 	"github.com/christianjombo/go-dbmcp/internal/guard"
 	"github.com/christianjombo/go-dbmcp/internal/mcpsrv"
+	"github.com/christianjombo/go-dbmcp/internal/synthetic"
 )
 
 // MCP endpoints.
@@ -33,9 +34,10 @@ const (
 
 // Deps are the collaborators the HTTP layer needs.
 type Deps struct {
-	Cfg     *config.Config
-	Log     *slog.Logger
-	Scanner *guard.Scanner
+	Cfg       *config.Config
+	Log       *slog.Logger
+	Scanner   *guard.Scanner
+	Synthetic *synthetic.Interceptor
 }
 
 // Server wraps the router with the runtime counters exposed on /healthz.
@@ -120,7 +122,8 @@ func New(d Deps) *Server {
 				"activeStreams", s.activeStreams.Add(-1))
 		})
 
-		return mcpsrv.New(mcpsrv.Deps{Cfg: d.Cfg, Log: d.Log, Scanner: d.Scanner}, session)
+		return mcpsrv.New(mcpsrv.Deps{Cfg: d.Cfg, Log: d.Log, Scanner: d.Scanner,
+			Synthetic: d.Synthetic}, session)
 	}
 
 	sse := mcp.NewSSEHandler(getServer, &mcp.SSEOptions{
