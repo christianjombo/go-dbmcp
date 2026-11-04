@@ -17,11 +17,19 @@ import (
 	"github.com/christianjombo/go-dbmcp/internal/mcpsrv"
 )
 
-// ConnectPath is the MCP SSE endpoint. The same path serves both halves of
-// the 2024-11-05 HTTP+SSE transport: GET opens the event stream and creates a
-// session, and the client POSTs its messages back to the same path carrying
-// the ?sessionid= the server issued in the opening `endpoint` event.
-const ConnectPath = "/v1/mcp/connect"
+// MCP endpoints.
+//
+// ConnectPath serves BOTH transports. Claude's custom connector speaks
+// Streamable HTTP (the current spec) and probes a new connector by POSTing an
+// `initialize` request; the legacy 2024-11-05 SSE handler answers that with
+// "sessionid must be provided", which the connector reports as an unreachable
+// server. Dispatching on the shape of the request means an existing
+// configuration keeps working without anyone re-entering a different URL.
+const (
+	ConnectPath    = "/v1/mcp/connect"
+	StreamablePath = "/v1/mcp"
+	ShortPath      = "/mcp"
+)
 
 // Deps are the collaborators the HTTP layer needs.
 type Deps struct {
@@ -56,7 +64,7 @@ func New(d Deps) *Server {
 	if err != nil {
 		// Config validation already clamps this to a known value; belt and
 		// braces so a future edit cannot leave the engine empty.
-		defaultEngine = dbconn.EnginePostgres
+		defaultEngine = dbconn.EngineMySQL
 	}
 
 	defaults := dbconn.Defaults{
@@ -66,42 +74,48 @@ func New(d Deps) *Server {
 		BlockPrivateHosts: d.Cfg.BlockPrivateHosts,
 	}
 
-	// getServer runs once per opened SSE stream. Everything a tenant touches
-	// — credentials, pool, MCP server — is created here and dies with the
+	// getServer runs once per MCP session. Everything a tenant touches —
+	// credentials, pool, MCP server — is created here and dies with the
 	// request context, which is what makes the proxy stateless.
-	sse := mcp.NewSSEHandler(func(r *http.Request) *mcp.Server {
-		creds, ok := CredentialsFrom(r.Context())
-		if !ok {
-			// Unreachable in practice: RequireCredentials gates every GET.
-			// Returning nil makes the SDK answer 400 rather than panic.
-			d.Log.Error("stream reached transport without credentials",
-				"requestId", RequestIDFrom(r.Context()))
-			return nil
+	//
+	// A session is created even when no credentials were supplied, so the
+	// handshake and tools/list still succeed. A client must be able to
+	// connect and discover what a server offers before it is configured;
+	// Claude's connector probe does exactly that, and treats any 4xx as an
+	// unreachable server. Tool calls then report precisely what is missing.
+	getServer := func(r *http.Request) *mcp.Server {
+		var session *dbconn.Session
+
+		if creds, ok := CredentialsFrom(r.Context()); ok {
+			session = dbconn.NewSession(r.Context(), creds, sessionCfg, d.Log)
+			d.Log.Info("mcp session opened",
+				"requestId", RequestIDFrom(r.Context()),
+				"transport", transportName(r),
+				"fingerprint", creds.Fingerprint(),
+				"activeStreams", s.activeStreams.Add(1))
+		} else {
+			session = dbconn.NewUnconfiguredSession(r.Context(),
+				CredentialsErrFrom(r.Context()), sessionCfg, d.Log)
+			d.Log.Info("mcp session opened without credentials",
+				"requestId", RequestIDFrom(r.Context()),
+				"transport", transportName(r),
+				"activeStreams", s.activeStreams.Add(1))
 		}
 
-		// The session binds the pool to this stream's context. When the AI
-		// client drops the connection, r.Context() fires and the session
-		// cancels in-flight queries and closes the pool — no leaked backends
-		// on the host.
-		session := dbconn.NewSession(r.Context(), creds, sessionCfg, d.Log)
-
-		s.activeStreams.Add(1)
 		s.totalStreams.Add(1)
 		context.AfterFunc(r.Context(), func() {
-			s.activeStreams.Add(-1)
-			d.Log.Info("stream closed",
+			d.Log.Info("mcp session closed",
 				"requestId", RequestIDFrom(r.Context()),
-				"fingerprint", creds.Fingerprint(),
-				"activeStreams", s.activeStreams.Load())
+				"activeStreams", s.activeStreams.Add(-1))
 		})
 
-		d.Log.Info("stream opened",
-			"requestId", RequestIDFrom(r.Context()),
-			"fingerprint", creds.Fingerprint(),
-			"activeStreams", s.activeStreams.Load())
-
 		return mcpsrv.New(mcpsrv.Deps{Cfg: d.Cfg, Log: d.Log, Scanner: d.Scanner}, session)
-	}, &mcp.SSEOptions{
+	}
+
+	sse := mcp.NewSSEHandler(getServer, &mcp.SSEOptions{
+		DisableLocalhostProtection: d.Cfg.DisableLocalhostProtection,
+	})
+	streamable := mcp.NewStreamableHTTPHandler(getServer, &mcp.StreamableHTTPOptions{
 		DisableLocalhostProtection: d.Cfg.DisableLocalhostProtection,
 	})
 
@@ -110,13 +124,30 @@ func New(d Deps) *Server {
 	r.Use(Recover(d.Log))
 	r.Use(AccessLog(d.Log))
 
-	r.Get("/healthz", s.health(d.Cfg, true))
-	r.Get("/readyz", s.health(d.Cfg, false))
-	r.Get("/", s.describe(d.Cfg))
+	r.Get("/healthz", s.health(d.Cfg))
+	r.Get("/readyz", s.health(d.Cfg))
+	r.Get("/", s.describe(d.Cfg, defaults))
+
+	// No authentication is required, so OAuth discovery must say so plainly.
+	// A 404 here is the spec's way of reporting "not an OAuth protected
+	// resource"; combined with never answering 401, it lets a client conclude
+	// that no sign-in is needed. Serving an explicit body makes that a
+	// decision rather than a routing gap.
+	for _, path := range []string{
+		"/.well-known/oauth-protected-resource",
+		"/.well-known/oauth-protected-resource/*",
+		"/.well-known/oauth-authorization-server",
+		"/.well-known/oauth-authorization-server/*",
+		"/.well-known/openid-configuration",
+	} {
+		r.Handle(path, noAuthRequired())
+	}
 
 	r.Group(func(r chi.Router) {
-		r.Use(RequireCredentials(d.Log, defaults))
-		r.Handle(ConnectPath, sse)
+		r.Use(ResolveCredentials(d.Log, defaults))
+		r.Handle(ConnectPath, dualTransport(sse, streamable))
+		r.Handle(StreamablePath, streamable)
+		r.Handle(ShortPath, streamable)
 	})
 
 	s.Handler = r
@@ -127,7 +158,7 @@ func New(d Deps) *Server {
 // uses it to report what it is waiting on.
 func (s *Server) ActiveStreams() int64 { return s.activeStreams.Load() }
 
-func (s *Server) health(cfg *config.Config, _ bool) http.HandlerFunc {
+func (s *Server) health(cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Deliberately does not touch any database. This process holds no
 		// database of its own, and a tenant's unreachable server must never
@@ -142,19 +173,31 @@ func (s *Server) health(cfg *config.Config, _ bool) http.HandlerFunc {
 	}
 }
 
-func (s *Server) describe(cfg *config.Config) http.HandlerFunc {
+func (s *Server) describe(cfg *config.Config, defaults dbconn.Defaults) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"service":   "mcp-proxy",
-			"version":   cfg.Version,
-			"transport": "mcp/sse (2024-11-05)",
-			"endpoint":  ConnectPath,
-			"headers": map[string]any{
-				"required": []string{"x-db-username", "x-db-password", "x-db-host", "x-db-port"},
-				"optional": map[string]string{
-					"x-db-database": cfg.DefaultDatabase,
-					"x-db-sslmode":  cfg.DefaultSSLMode,
+			"service":        "mcp-proxy",
+			"version":        cfg.Version,
+			"authentication": "none — no sign-in and no OAuth; database credentials travel per request",
+			"endpoints": map[string]string{
+				"streamableHttp": StreamablePath + "  (also " + ShortPath + " and " + ConnectPath + ")",
+				"sse":            ConnectPath + "  (legacy 2024-11-05 transport)",
+			},
+			"credentials": map[string]any{
+				"urlParameters": "?type=mysql&host=db.example.com&port=3306&db=appdb&user=app_reader " +
+					"(do not put the password here — connector URLs are shown in plaintext and logged)",
+				"secretHeader": "x-api-key: <password>   (recommended; the value is the bare password, " +
+					"no Bearer prefix). The same header also accepts a complete DSN, plain or base64.",
+				"splitHeaders": "x-tenant-id: mysql://user@host:3306/db   +   x-api-key: <password>",
+				"granular": map[string]any{
+					"required": []string{"x-db-username", "x-db-password", "x-db-host", "x-db-port"},
+					"optional": map[string]string{
+						"x-db-type":     string(defaults.Engine),
+						"x-db-database": describeDefaultDatabase(defaults),
+						"x-db-sslmode":  defaults.SSLMode,
+					},
 				},
+				"precedence": "url parameters < consolidated headers < x-db-* headers",
 			},
 			"serialization": map[string]any{
 				"jsonMaxRows": cfg.JSONMaxRows,
@@ -162,6 +205,51 @@ func (s *Server) describe(cfg *config.Config) http.HandlerFunc {
 			},
 		})
 	}
+}
+
+// dualTransport routes one path to whichever MCP transport the client speaks.
+//
+// The two are distinguishable in practice: legacy SSE opens with a plain GET
+// and tags every later message with ?sessionid=, while Streamable HTTP POSTs
+// JSON-RPC with no sessionid and carries its session in Mcp-Session-Id.
+func dualTransport(sse, streamable http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isLegacySSE(r) {
+			sse.ServeHTTP(w, r)
+			return
+		}
+		streamable.ServeHTTP(w, r)
+	})
+}
+
+func isLegacySSE(r *http.Request) bool {
+	if r.URL.Query().Get("sessionid") != "" {
+		return true // legacy message endpoint
+	}
+	if r.Header.Get("Mcp-Session-Id") != "" {
+		return false // an established Streamable HTTP session
+	}
+	// A bare GET opens a legacy SSE stream; Streamable HTTP clients start
+	// with a POST.
+	return r.Method == http.MethodGet
+}
+
+func transportName(r *http.Request) string {
+	if isLegacySSE(r) {
+		return "sse"
+	}
+	return "streamable-http"
+}
+
+// noAuthRequired answers OAuth discovery with an explicit "nothing here".
+func noAuthRequired() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"error": "no_authentication_required",
+			"detail": "This MCP server uses no OAuth and requires no sign-in. Database " +
+				"credentials are supplied per request; see / for the contract.",
+		})
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

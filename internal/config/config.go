@@ -34,7 +34,9 @@ type Config struct {
 	CSVMaxRows  int
 
 	// Defaults applied to optional x-db-* headers.
-	DefaultDBType   string
+	DefaultDBType string
+	// DefaultDatabase empty means "derive from the engine" — see
+	// dbconn.Engine.DefaultDatabase.
 	DefaultDatabase string
 	DefaultSSLMode  string
 
@@ -88,8 +90,11 @@ func Load(version string) (*Config, []string) {
 		JSONMaxRows: envInt("MCP_JSON_MAX_ROWS", DefaultJSONMaxRows, 1, 1_000_000, w),
 		CSVMaxRows:  envInt("MCP_CSV_MAX_ROWS", DefaultCSVMaxRows, 1, 10_000_000, w),
 
-		DefaultDBType:   strings.ToLower(envStr("MCP_DEFAULT_DB_TYPE", "postgres")),
-		DefaultDatabase: envStr("MCP_DEFAULT_DATABASE", "postgres"),
+		DefaultDBType: strings.ToLower(envStr("MCP_DEFAULT_DB_TYPE", "mysql")),
+		// Empty means "whatever the chosen engine conventionally expects":
+		// "postgres" for PostgreSQL, no database selected for MySQL. A
+		// single literal default cannot be correct for both.
+		DefaultDatabase: envStr("MCP_DEFAULT_DATABASE", ""),
 		DefaultSSLMode:  envStr("MCP_DEFAULT_SSLMODE", "prefer"),
 
 		QueryTimeout:        envDurMS("MCP_QUERY_TIMEOUT_MS", 30_000, 100, 600_000, w),
@@ -127,8 +132,8 @@ func Load(version string) (*Config, []string) {
 	switch c.DefaultDBType {
 	case "postgres", "postgresql", "pg", "psql", "mysql", "mariadb":
 	default:
-		w("MCP_DEFAULT_DB_TYPE %q is not a supported database type; falling back to \"postgres\"", c.DefaultDBType)
-		c.DefaultDBType = "postgres"
+		w("MCP_DEFAULT_DB_TYPE %q is not a supported database type; falling back to \"mysql\"", c.DefaultDBType)
+		c.DefaultDBType = "mysql"
 	}
 
 	if !validSSLMode(c.DefaultSSLMode) {

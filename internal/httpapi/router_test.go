@@ -70,45 +70,45 @@ func TestHealthzIsIndependentOfAnyDatabase(t *testing.T) {
 	}
 }
 
-func TestConnectRejectsMissingHeaders(t *testing.T) {
+// Connecting with no credentials at all must SUCCEED.
+//
+// Claude's connector setup probes a new server before it has been
+// configured and reports any 4xx as "server unreachable". A credential check
+// at connect time therefore looked like a broken server. Credentials are
+// required at tool-call time instead, where the message can be read.
+func TestConnectSucceedsWithoutCredentials(t *testing.T) {
 	srv := newTestServer(t)
 
-	resp, err := http.Get(srv.URL + ConnectPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+ConnectPath, nil)
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 — a probe with no credentials must not look like a broken server",
+			resp.StatusCode)
 	}
-
-	var body struct {
-		Error    string            `json:"error"`
-		Missing  []string          `json:"missing_headers"`
-		Required []string          `json:"required_headers"`
-		Optional map[string]string `json:"optional_headers_with_defaults"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatal(err)
-	}
-
-	if body.Error != "invalid_db_headers" {
-		t.Errorf("error = %q", body.Error)
-	}
-	if len(body.Missing) != 4 {
-		t.Errorf("missing = %v, want all four mandatory headers", body.Missing)
-	}
-	// The error must be actionable: it should tell the client what to send.
-	if len(body.Required) == 0 || body.Optional["x-db-database"] != "postgres" {
-		t.Errorf("error body does not document the expected headers: %+v", body)
+	if event, _ := readFirstEvent(t, resp.Body); event != "endpoint" {
+		t.Errorf("first event = %q, want endpoint", event)
 	}
 }
 
-func TestConnectRejectsInvalidPort(t *testing.T) {
+// Likewise for a malformed value: the stream opens and the problem surfaces
+// on use, not during discovery.
+func TestConnectSucceedsWithInvalidPort(t *testing.T) {
 	srv := newTestServer(t)
 
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+ConnectPath, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+ConnectPath, nil)
 	req.Header.Set("x-db-username", "u")
 	req.Header.Set("x-db-password", "p")
 	req.Header.Set("x-db-host", "db.example.com")
@@ -120,17 +120,66 @@ func TestConnectRejectsInvalidPort(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	var body struct {
-		Invalid map[string]string `json:"invalid_headers"`
+}
+
+// OAuth discovery must answer definitively so a client can conclude that no
+// sign-in is required, rather than reporting "couldn't determine how this
+// server signs in".
+func TestOAuthDiscoveryReportsNoAuthRequired(t *testing.T) {
+	srv := newTestServer(t)
+
+	for _, path := range []string{
+		"/.well-known/oauth-protected-resource",
+		"/.well-known/oauth-authorization-server",
+		"/.well-known/openid-configuration",
+	} {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("%s: status = %d, want 404", path, resp.StatusCode)
+		}
+		if !strings.Contains(string(body), "no_authentication_required") {
+			t.Errorf("%s: body should state that no auth is required, got: %s", path, body)
+		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := body.Invalid["x-db-port"]; !ok {
-		t.Errorf("expected x-db-port to be flagged, got %v", body.Invalid)
+}
+
+// The endpoint must also speak the current Streamable HTTP transport, which
+// is what Claude's connector uses.
+func TestStreamableHTTPInitializeSucceeds(t *testing.T) {
+	srv := newTestServer(t)
+
+	for _, path := range []string{ConnectPath, StreamablePath, ShortPath} {
+		body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{` +
+			`"protocolVersion":"2025-06-18","capabilities":{},` +
+			`"clientInfo":{"name":"probe","version":"1"}}}`
+
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		got, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s: status = %d, want 200: %s", path, resp.StatusCode, got)
+			continue
+		}
+		if !strings.Contains(string(got), "serverInfo") {
+			t.Errorf("%s: initialize did not return serverInfo: %s", path, got)
+		}
 	}
 }
 
@@ -216,23 +265,23 @@ func TestStreamCloseReleasesSession(t *testing.T) {
 	t.Fatalf("active streams = %d after disconnect, want 0", s.ActiveStreams())
 }
 
-func TestPostWithoutSessionIDIsRejected(t *testing.T) {
+// A POST carrying the legacy sessionid parameter still routes to the SSE
+// transport, so existing clients are unaffected by the dual dispatch.
+func TestLegacySessionIDRoutesToSSE(t *testing.T) {
 	srv := newTestServer(t)
 
-	resp, err := http.Post(srv.URL+ConnectPath, "application/json", strings.NewReader(`{}`))
+	resp, err := http.Post(srv.URL+ConnectPath+"?sessionid=does-not-exist",
+		"application/json", strings.NewReader(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-
-	// POSTs skip header validation by design; they are authorised by the
-	// server-issued sessionid instead, so the failure must be about that.
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
-	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "sessionid") {
-		t.Errorf("expected a sessionid complaint, got: %s", body)
+
+	// The SSE handler owns this request and reports an unknown session;
+	// the Streamable HTTP handler would instead complain about Accept.
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (session not found), got body: %s", resp.StatusCode, body)
 	}
 }
 

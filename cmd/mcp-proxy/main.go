@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/christianjombo/go-dbmcp/internal/config"
+	"github.com/christianjombo/go-dbmcp/internal/dbconn"
 	"github.com/christianjombo/go-dbmcp/internal/guard"
 	"github.com/christianjombo/go-dbmcp/internal/httpapi"
 	"github.com/christianjombo/go-dbmcp/internal/logging"
@@ -42,10 +43,19 @@ func main() {
 
 func run() error {
 	showVersion := flag.Bool("version", false, "print the version and exit")
+	encodeDSN := flag.String("encode-dsn", "",
+		"encode a connection string for clients that cannot send custom headers, then exit")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("mcp-proxy %s (%s %s/%s)\n", version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+		return nil
+	}
+
+	if *encodeDSN != "" {
+		// Hand-rolling this with `base64` tends to append a newline, which
+		// becomes part of the password and fails authentication confusingly.
+		fmt.Println(dbconn.EncodeToken(*encodeDSN))
 		return nil
 	}
 

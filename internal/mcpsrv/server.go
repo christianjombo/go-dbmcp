@@ -32,11 +32,56 @@ type handlers struct {
 	sess *dbconn.Session
 }
 
+// engine is the target engine, falling back to the server default when the
+// session has no credentials yet.
+func (h *handlers) engine() dbconn.Engine {
+	if c := h.sess.Credentials(); c != nil && c.Engine != "" {
+		return c.Engine
+	}
+	if e, err := dbconn.ParseEngine(h.Cfg.DefaultDBType); err == nil {
+		return e
+	}
+	return dbconn.EngineMySQL
+}
+
+// fingerprint is a log-safe session identifier, safe on an unconfigured
+// session.
+func (h *handlers) fingerprint() string {
+	if c := h.sess.Credentials(); c != nil {
+		return c.Fingerprint()
+	}
+	return "unconfigured"
+}
+
+// requireCredentials returns a tool error explaining how to configure the
+// connector, or nil when the session is ready to use.
+func (h *handlers) requireCredentials() *mcp.CallToolResult {
+	if h.sess.Configured() {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString("⚙️ THIS CONNECTOR HAS NO DATABASE CREDENTIALS YET\n\n")
+	if err := h.sess.ConfigError(); err != nil {
+		fmt.Fprintf(&b, "What is missing: %v\n\n", err)
+	}
+	b.WriteString("Supply the target in any one of these ways and reconnect.\n\n" +
+		"1. RECOMMENDED — target in the connector URL, password in one header:\n" +
+		"     URL:    .../v1/mcp/connect?type=mysql&host=db.example.com&port=3306&db=appdb&user=app_reader\n" +
+		"     Header: x-api-key: <password>\n\n" +
+		"2. Entirely in one header:\n" +
+		"     x-api-key: <base64 of mysql://user:password@host:3306/appdb>\n\n" +
+		"3. Granular headers, for clients that allow custom names:\n" +
+		"     x-db-type, x-db-username, x-db-password, x-db-host, x-db-port, x-db-database\n\n" +
+		"Do not put the password in the URL: connector URLs are displayed in plaintext " +
+		"and recorded in server logs.")
+	return errorResult(b.String())
+}
+
 // New builds an MCP server bound to one tenant session. One of these exists
 // per live SSE stream.
 func New(d Deps, sess *dbconn.Session) *mcp.Server {
 	h := &handlers{Deps: d, sess: sess}
-	engine := sess.Credentials().Engine
+	engine := h.engine()
 
 	srv := mcp.NewServer(
 		&mcp.Implementation{
@@ -167,13 +212,16 @@ type DescribeTableInput struct {
 // -------------------------------------------------------------- tool handlers
 
 func (h *handlers) executeQuery(ctx context.Context, _ *mcp.CallToolRequest, in ExecuteQueryInput) (*mcp.CallToolResult, any, error) {
+	if res := h.requireCredentials(); res != nil {
+		return res, nil, nil
+	}
 	decision := h.Scanner.Inspect(in.SQL)
 	if !decision.Allowed {
 		h.Log.Warn("statement refused by guardrail",
 			"rule", decision.RuleID,
 			"command", decision.Command,
-			"engine", string(h.sess.Credentials().Engine),
-			"fingerprint", h.sess.Credentials().Fingerprint())
+			"engine", string(h.engine()),
+			"fingerprint", h.fingerprint())
 		return errorResult(guard.BlockMessage(decision)), nil, nil
 	}
 
@@ -181,10 +229,16 @@ func (h *handlers) executeQuery(ctx context.Context, _ *mcp.CallToolRequest, in 
 }
 
 func (h *handlers) listTables(ctx context.Context, _ *mcp.CallToolRequest, in ListTablesInput) (*mcp.CallToolResult, any, error) {
+	if res := h.requireCredentials(); res != nil {
+		return res, nil, nil
+	}
 	return h.run(ctx, h.sess.Credentials().ListTablesStatement(in.Schema))
 }
 
 func (h *handlers) describeTable(ctx context.Context, _ *mcp.CallToolRequest, in DescribeTableInput) (*mcp.CallToolResult, any, error) {
+	if res := h.requireCredentials(); res != nil {
+		return res, nil, nil
+	}
 	if strings.TrimSpace(in.Table) == "" {
 		return errorResult("The `table` argument is required and must not be empty."), nil, nil
 	}
@@ -192,6 +246,9 @@ func (h *handlers) describeTable(ctx context.Context, _ *mcp.CallToolRequest, in
 }
 
 func (h *handlers) pingDatabase(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+	if res := h.requireCredentials(); res != nil {
+		return res, nil, nil
+	}
 	creds := h.sess.Credentials()
 
 	pool, err := h.sess.Acquire(ctx)
@@ -309,13 +366,13 @@ func (h *handlers) run(ctx context.Context, st dbconn.Statement) (*mcp.CallToolR
 	}
 
 	h.Log.Debug("query complete",
-		"engine", string(h.sess.Credentials().Engine),
+		"engine", string(h.engine()),
 		"command", st.Command,
 		"tier", result.Tier,
 		"rows", result.RowsShown,
 		"truncated", result.Truncated,
 		"elapsedMs", time.Since(start).Milliseconds(),
-		"fingerprint", h.sess.Credentials().Fingerprint())
+		"fingerprint", h.fingerprint())
 
 	return textResult(result.Text), nil, nil
 }

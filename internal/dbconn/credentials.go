@@ -121,6 +121,32 @@ func FromHeaders(h http.Header, d Defaults) (*Credentials, error) {
 		return strings.TrimSpace(vs[0]), true
 	}
 
+	// Consolidated form first. Some clients — Claude's custom connector among
+	// them — restrict header names to an approved list and cannot send
+	// x-db-*, so the whole target arrives as one connection string in a
+	// standard header. The discriminator is x-db-host: if the caller supplied
+	// the granular headers, those win and the token is ignored.
+	if _, hasGranularHost := get(HeaderHost); !hasGranularHost {
+		c, err := credentialsFromApprovedHeaders(h, d)
+		switch {
+		case err == nil:
+			return c, nil
+		case !errors.Is(err, ErrNoToken):
+			ve.Invalid["authorization / x-api-key / x-tenant-id"] = err.Error()
+			return nil, ve
+		}
+		// ErrNoToken: fall through and report the granular headers as missing.
+		// If a secret header WAS supplied, it is a bare password with no
+		// target attached — say so, because "missing x-db-host" alone would
+		// not tell the operator that the half they sent was understood.
+		if stripAuthScheme(firstHeader(h, secretHeaders)) != "" {
+			ve.Invalid["connection target"] = "a password was received, but nothing says which database " +
+				"to connect to. Add the target to the connector URL " +
+				"(?type=mysql&host=...&port=...&db=...&user=...), or send a full connection string " +
+				"in x-api-key instead of a bare password."
+		}
+	}
+
 	username, hasUser := get(HeaderUsername)
 	// The password header must be present, but an empty value is permitted:
 	// `trust` and `peer` authentication are legitimate configurations and
@@ -192,7 +218,14 @@ func FromHeaders(h http.Header, d Defaults) (*Credentials, error) {
 
 	database, hasDB := get(HeaderDatabase)
 	if !hasDB || database == "" {
-		c.Database = d.Database
+		// An operator-configured default wins; otherwise fall back to what
+		// the chosen engine conventionally expects, which is not the same
+		// for both.
+		if d.Database != "" {
+			c.Database = d.Database
+		} else {
+			c.Database = c.Engine.DefaultDatabase()
+		}
 	} else if err := validIdentifier(database, 63); err != nil {
 		ve.Invalid[WireHeaderNames[HeaderDatabase]] = err.Error()
 	} else {
@@ -202,17 +235,40 @@ func FromHeaders(h http.Header, d Defaults) (*Credentials, error) {
 	sslmode, hasSSL := get(HeaderSSLMode)
 	if !hasSSL || sslmode == "" {
 		c.SSLMode = d.SSLMode
-	} else if !validSSLModes[strings.ToLower(sslmode)] {
+	} else if normalised := NormalizeSSLMode(sslmode); !validSSLModes[normalised] {
 		ve.Invalid[WireHeaderNames[HeaderSSLMode]] = fmt.Sprintf(
-			"%q is not a valid libpq sslmode (disable, allow, prefer, require, verify-ca, verify-full)", sslmode)
+			"%q is not a valid sslmode (disable, allow, prefer, require, verify-ca, verify-full; "+
+				"MySQL spellings DISABLED/PREFERRED/REQUIRED/VERIFY_CA/VERIFY_IDENTITY are also accepted)", sslmode)
 	} else {
-		c.SSLMode = strings.ToLower(sslmode)
+		c.SSLMode = normalised
 	}
 
 	if len(ve.Missing) > 0 || len(ve.Invalid) > 0 {
 		return nil, ve
 	}
 	return c, nil
+}
+
+// NormalizeSSLMode maps the spellings the two ecosystems actually use onto
+// libpq vocabulary. MySQL (and DigitalOcean's console, which quotes MySQL)
+// says DISABLED / PREFERRED / REQUIRED / VERIFY_CA / VERIFY_IDENTITY, and a
+// user pasting "REQUIRED" from a provider dashboard should not have to
+// discover that this server wanted "require".
+func NormalizeSSLMode(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "disabled":
+		return "disable"
+	case "preferred":
+		return "prefer"
+	case "required":
+		return "require"
+	case "verify_ca", "verify ca":
+		return "verify-ca"
+	case "verify_identity", "verify-identity", "verify_full", "verify full":
+		return "verify-full"
+	default:
+		return strings.ToLower(strings.TrimSpace(v))
+	}
 }
 
 var validSSLModes = map[string]bool{
@@ -245,9 +301,15 @@ func validHost(h string) (string, error) {
 	return h, nil
 }
 
-// validIdentifier rejects control characters and absurd lengths. Quoting is
-// handled structurally by net/url when the DSN is assembled, so this is a
-// sanity check rather than the escaping mechanism.
+// validIdentifier rejects control characters, path separators and absurd
+// lengths. Quoting is handled structurally by net/url and mysql.Config when
+// the DSN is assembled, so this is a sanity check rather than the escaping
+// mechanism.
+//
+// Slashes are rejected because neither engine permits them in a database or
+// role name, and allowing them would let a connection-string path segment
+// like `db/../../etc` through as a "database name" — meaningless at best,
+// and confusing in logs and error messages.
 func validIdentifier(s string, max int) error {
 	if s == "" {
 		return errors.New("must not be empty")
@@ -256,8 +318,11 @@ func validIdentifier(s string, max int) error {
 		return fmt.Errorf("exceeds %d characters", max)
 	}
 	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
+		switch {
+		case r < 0x20 || r == 0x7f:
 			return errors.New("contains control characters")
+		case r == '/' || r == '\\':
+			return errors.New("must not contain path separators")
 		}
 	}
 	return nil
@@ -365,7 +430,12 @@ func (c *Credentials) Fingerprint() string {
 
 // Target is the human-readable destination, without credentials.
 func (c *Credentials) Target() string {
-	return fmt.Sprintf("%s://%s:%d/%s", c.Engine, c.Host, c.Port, c.Database)
+	db := c.Database
+	if db == "" {
+		// Legitimate on MySQL: the connection selects no default database.
+		db = "(none)"
+	}
+	return fmt.Sprintf("%s://%s:%d/%s", c.Engine, c.Host, c.Port, db)
 }
 
 // String implements fmt.Stringer with the password redacted.

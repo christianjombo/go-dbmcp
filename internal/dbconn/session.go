@@ -41,8 +41,13 @@ type SessionConfig struct {
 //     connection.
 type Session struct {
 	creds *Credentials
-	cfg   SessionConfig
-	log   *slog.Logger
+	// credsErr is set when the request carried no usable credentials. The
+	// session still exists so the MCP handshake and tools/list succeed —
+	// a client must be able to discover what a server offers before it has
+	// been configured — and the error surfaces on the first tool call.
+	credsErr error
+	cfg      SessionConfig
+	log      *slog.Logger
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -57,10 +62,13 @@ type Session struct {
 // the context fires and Close tears the pool down.
 func NewSession(parent context.Context, creds *Credentials, cfg SessionConfig, log *slog.Logger) *Session {
 	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	if creds != nil {
+		log = log.With("fingerprint", creds.Fingerprint(), "target", creds.Target())
+	}
 	s := &Session{
 		creds:  creds,
 		cfg:    cfg,
-		log:    log.With("fingerprint", creds.Fingerprint(), "target", creds.Target()),
+		log:    log,
 		ctx:    ctx,
 		cancel: cancel,
 	}
@@ -73,8 +81,30 @@ func NewSession(parent context.Context, creds *Credentials, cfg SessionConfig, l
 	return s
 }
 
+// NewUnconfiguredSession represents a stream whose request carried no usable
+// credentials. The MCP handshake still completes, so a client can connect and
+// list tools; calling one reports credsErr.
+func NewUnconfiguredSession(parent context.Context, credsErr error, cfg SessionConfig, log *slog.Logger) *Session {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	s := &Session{credsErr: credsErr, cfg: cfg, log: log, ctx: ctx, cancel: cancel}
+	context.AfterFunc(parent, func() { s.Close() })
+	return s
+}
+
+// Configured reports whether this session has usable database credentials.
+func (s *Session) Configured() bool { return s.creds != nil && s.credsErr == nil }
+
+// ConfigError explains why the session has no credentials, or nil.
+func (s *Session) ConfigError() error { return s.credsErr }
+
 // Acquire returns the pool, creating and verifying it on first use.
 func (s *Session) Acquire(ctx context.Context) (Pool, error) {
+	if !s.Configured() {
+		if s.credsErr != nil {
+			return nil, s.credsErr
+		}
+		return nil, errors.New("this stream has no database credentials")
+	}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()

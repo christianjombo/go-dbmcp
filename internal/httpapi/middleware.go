@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"runtime/debug"
 	"time"
 
@@ -19,6 +20,7 @@ type ctxKey int
 const (
 	ctxKeyRequestID ctxKey = iota
 	ctxKeyCredentials
+	ctxKeyCredentialsErr
 )
 
 // RequestIDFrom returns the correlation id assigned to this request.
@@ -99,7 +101,7 @@ func AccessLog(log *slog.Logger) func(http.Handler) http.Handler {
 			log.Info("http request",
 				"requestId", RequestIDFrom(r.Context()),
 				"method", r.Method,
-				"path", r.URL.Path,
+				"path", redactQuery(r.URL),
 				"status", rec.status,
 				"bytes", rec.written,
 				"durationMs", time.Since(start).Milliseconds(),
@@ -107,6 +109,31 @@ func AccessLog(log *slog.Logger) func(http.Handler) http.Handler {
 				"userAgent", r.UserAgent())
 		})
 	}
+}
+
+// redactQuery renders a URL for logging with any credential-bearing query
+// parameter masked.
+//
+// Connection details may be supplied in the query string for clients that
+// cannot set headers, and some of those clients will put the password there
+// too. Logging the raw request line would then write tenant passwords to disk
+// on every request, so the value is replaced before it reaches the log.
+func redactQuery(u *url.URL) string {
+	if u.RawQuery == "" {
+		return u.Path
+	}
+	q := u.Query()
+	redacted := false
+	for _, name := range []string{"password", "pass", "pwd", "db_password", "dsn", "url", "uri", "connection_string"} {
+		if q.Get(name) != "" {
+			q.Set(name, "REDACTED")
+			redacted = true
+		}
+	}
+	if !redacted {
+		return u.Path + "?" + u.RawQuery
+	}
+	return u.Path + "?" + q.Encode()
 }
 
 // recorder captures status and size without breaking streaming.
@@ -149,68 +176,63 @@ func (r *recorder) Flush() {
 // Unwrap exposes the underlying writer to http.ResponseController.
 func (r *recorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
-// RequireCredentials parses and validates the x-db-* headers and attaches the
-// result to the request context.
+// ResolveCredentials parses the x-db-* headers (or the consolidated
+// connection-string header) and attaches the result to the request context.
 //
-// It enforces only on GET, the request that opens an SSE stream and creates
-// the session. The subsequent POSTs carry an unguessable sessionid issued by
-// the server and are bound to a session that was already authorised; some MCP
-// clients do not replay custom headers onto the message endpoint, so demanding
-// them there would break those clients for no security gain.
-func RequireCredentials(log *slog.Logger, defaults dbconn.Defaults) func(http.Handler) http.Handler {
+// It never rejects the request. An MCP client must be able to complete the
+// handshake and list tools before it has been configured — Claude's connector
+// setup probes the endpoint with no credentials at all and treats any 4xx as
+// "server unreachable", which made a credential check here look like a broken
+// server. Missing or invalid credentials are therefore carried forward and
+// reported on the first tool call, where the message can actually be read.
+func ResolveCredentials(log *slog.Logger, defaults dbconn.Defaults) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodGet {
-				next.ServeHTTP(w, r)
-				return
-			}
+			creds, err := dbconn.FromRequest(r, defaults)
+			ctx := r.Context()
 
-			creds, err := dbconn.FromHeaders(r.Header, defaults)
 			if err != nil {
-				var ve *dbconn.ValidationError
-				body := errorBody{
-					Error: "invalid_db_headers",
-					Message: "This proxy is stateless and takes the target database from request headers. " +
-						"Fix the headers listed below in your MCP client configuration and reconnect.",
-					Required: []string{"x-db-username", "x-db-password", "x-db-host", "x-db-port"},
-					Optional: map[string]string{
-						"x-db-database": defaults.Database,
-						"x-db-sslmode":  defaults.SSLMode,
-					},
-				}
-				if errors.As(err, &ve) {
-					body.Missing = ve.Missing
-					body.Invalid = ve.Invalid
-				} else {
-					body.Detail = err.Error()
-				}
-
-				log.Warn("rejected stream: invalid database headers",
-					"requestId", RequestIDFrom(r.Context()),
-					"missing", body.Missing,
-					"invalid", body.Invalid)
-
-				writeJSONError(w, http.StatusBadRequest, body)
-				return
+				log.Debug("stream has no usable database credentials yet",
+					"requestId", RequestIDFrom(ctx), "detail", err.Error())
+				ctx = context.WithValue(ctx, ctxKeyCredentialsErr, err)
+			} else {
+				log.Info("stream credentials resolved",
+					"requestId", RequestIDFrom(ctx), "db", creds)
+				ctx = context.WithValue(ctx, ctxKeyCredentials, creds)
 			}
 
-			log.Info("stream authorised",
-				"requestId", RequestIDFrom(r.Context()),
-				"db", creds)
-
-			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKeyCredentials, creds)))
+			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
 
+// CredentialsErrFrom returns why credential resolution failed, if it did.
+func CredentialsErrFrom(ctx context.Context) error {
+	err, _ := ctx.Value(ctxKeyCredentialsErr).(error)
+	return err
+}
+
+// describeDefaultDatabase renders what a client will actually get if it omits
+// x-db-database, which depends on the engine when no operator default is set.
+func describeDefaultDatabase(d dbconn.Defaults) string {
+	if d.Database != "" {
+		return d.Database
+	}
+	if derived := d.Engine.DefaultDatabase(); derived != "" {
+		return derived
+	}
+	return "(none selected — qualify table names or send x-db-database)"
+}
+
 type errorBody struct {
-	Error    string            `json:"error"`
-	Message  string            `json:"message"`
-	Detail   string            `json:"detail,omitempty"`
-	Missing  []string          `json:"missing_headers,omitempty"`
-	Invalid  map[string]string `json:"invalid_headers,omitempty"`
-	Required []string          `json:"required_headers,omitempty"`
-	Optional map[string]string `json:"optional_headers_with_defaults,omitempty"`
+	Error       string            `json:"error"`
+	Message     string            `json:"message"`
+	Alternative string            `json:"single_header_alternative,omitempty"`
+	Detail      string            `json:"detail,omitempty"`
+	Missing     []string          `json:"missing_headers,omitempty"`
+	Invalid     map[string]string `json:"invalid_headers,omitempty"`
+	Required    []string          `json:"required_headers,omitempty"`
+	Optional    map[string]string `json:"optional_headers_with_defaults,omitempty"`
 }
 
 func writeJSONError(w http.ResponseWriter, status int, body errorBody) {

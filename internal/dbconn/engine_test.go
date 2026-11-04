@@ -275,3 +275,59 @@ func TestMySQLValueToTextFormatsScalars(t *testing.T) {
 		}
 	}
 }
+
+// PostgreSQL always has a database called "postgres"; MySQL has no equivalent
+// always-present database, so the right default there is to select none.
+func TestEngineDefaultDatabase(t *testing.T) {
+	if got := EnginePostgres.DefaultDatabase(); got != "postgres" {
+		t.Errorf("postgres default database = %q, want \"postgres\"", got)
+	}
+	if got := EngineMySQL.DefaultDatabase(); got != "" {
+		t.Errorf("mysql default database = %q, want empty (no database selected)", got)
+	}
+}
+
+// With no operator default configured, the database must follow the engine
+// rather than inheriting a literal that is wrong for one of them.
+func TestDefaultDatabaseFollowsEngine(t *testing.T) {
+	d := Defaults{Engine: EngineMySQL, SSLMode: "prefer"} // Database intentionally empty
+
+	hdr := validHeaders()
+	hdr["x-db-port"] = "3306"
+	c, err := FromHeaders(headers(hdr), d)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Database != "" {
+		t.Errorf("mysql database = %q, want empty", c.Database)
+	}
+
+	hdr["x-db-type"] = "postgres"
+	c2, err := FromHeaders(headers(hdr), d)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c2.Database != "postgres" {
+		t.Errorf("postgres database = %q, want \"postgres\"", c2.Database)
+	}
+}
+
+// An explicit operator default still wins over the engine convention.
+func TestOperatorDefaultDatabaseWins(t *testing.T) {
+	d := Defaults{Engine: EngineMySQL, Database: "appdb", SSLMode: "prefer"}
+	c, err := FromHeaders(headers(validHeaders()), d)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Database != "appdb" {
+		t.Errorf("database = %q, want \"appdb\"", c.Database)
+	}
+}
+
+// A MySQL target with no database selected must still render readably.
+func TestTargetHandlesNoDatabase(t *testing.T) {
+	c := &Credentials{Engine: EngineMySQL, Host: "h", Port: 3306}
+	if got := c.Target(); got != "mysql://h:3306/(none)" {
+		t.Errorf("Target() = %q", got)
+	}
+}

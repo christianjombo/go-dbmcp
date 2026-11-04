@@ -1,4 +1,5 @@
-; systemd unit for mcp-proxy — stateless multi-tenant MCP/SSE PostgreSQL proxy.
+; systemd unit for mcp-proxy — stateless multi-tenant MCP/SSE SQL proxy
+; (PostgreSQL and MySQL/MariaDB).
 ;
 ; Install:
 ;   install -D -m 0755 bin/mcp-proxy-binary /opt/mcp-proxy/mcp-proxy-binary
@@ -10,7 +11,7 @@
 ;   systemctl daemon-reload && systemctl enable --now mcp-proxy
 
 [Unit]
-Description=MCP PostgreSQL Proxy (SSE transport)
+Description=MCP SQL Proxy for PostgreSQL and MySQL (SSE transport)
 Documentation=https://modelcontextprotocol.io/specification/2024-11-05/basic/transports
 ; network-online rather than plain network: the listener binds immediately and
 ; we would rather fail visibly than bind before the interface is configured.
@@ -44,7 +45,10 @@ Environment=MCP_JSON_MAX_ROWS=100
 Environment=MCP_CSV_MAX_ROWS=2000
 
 ; Defaults for the optional x-db-* headers.
-Environment=MCP_DEFAULT_DATABASE=postgres
+Environment=MCP_DEFAULT_DB_TYPE=mysql
+; Left unset on purpose: an empty MCP_DEFAULT_DATABASE means "derive from the
+; engine" — "postgres" for PostgreSQL, no database selected for MySQL. Pinning
+; a literal here would be wrong for one of the two.
 Environment=MCP_DEFAULT_SSLMODE=prefer
 
 ; Per-tenant pool and query bounds.

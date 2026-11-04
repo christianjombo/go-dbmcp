@@ -57,6 +57,21 @@ func (e Engine) DefaultPort() int {
 	return 5432
 }
 
+// DefaultDatabase is the database to connect to when the client sends no
+// x-db-database header and the operator has configured no default.
+//
+// The two engines genuinely differ here. PostgreSQL requires a database at
+// connection time and guarantees one named "postgres" exists. MySQL has no
+// such convention and no universally present database, so the right default
+// is to select none: the connection succeeds, and the client can either
+// qualify its table names (`appdb.users`) or supply x-db-database.
+func (e Engine) DefaultDatabase() string {
+	if e == EngineMySQL {
+		return ""
+	}
+	return "postgres"
+}
+
 // String implements fmt.Stringer.
 func (e Engine) String() string { return string(e) }
 
