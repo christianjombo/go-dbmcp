@@ -58,6 +58,7 @@ func New(d Deps) *Server {
 		MaxConnLifetime:   d.Cfg.PoolMaxConnLifetime,
 		BlockPrivateHosts: d.Cfg.BlockPrivateHosts,
 		PoolCloseGrace:    5 * time.Second,
+		IdleTimeout:       d.Cfg.SessionIdleTimeout,
 	}
 
 	defaultEngine, err := dbconn.ParseEngine(d.Cfg.DefaultDBType)
@@ -86,15 +87,25 @@ func New(d Deps) *Server {
 	getServer := func(r *http.Request) *mcp.Server {
 		var session *dbconn.Session
 
+		// Choose the right lifetime for the transport in use. A legacy SSE
+		// session lives exactly as long as its stream, so the request context
+		// is the teardown signal the spec asks for. A Streamable HTTP session
+		// outlives the POST that created it, so it is detached and reclaimed
+		// by the idle timer instead.
+		lifetime := r.Context()
+		if !isLegacySSE(r) {
+			lifetime = context.WithoutCancel(r.Context())
+		}
+
 		if creds, ok := CredentialsFrom(r.Context()); ok {
-			session = dbconn.NewSession(r.Context(), creds, sessionCfg, d.Log)
+			session = dbconn.NewSession(lifetime, creds, sessionCfg, d.Log)
 			d.Log.Info("mcp session opened",
 				"requestId", RequestIDFrom(r.Context()),
 				"transport", transportName(r),
 				"fingerprint", creds.Fingerprint(),
 				"activeStreams", s.activeStreams.Add(1))
 		} else {
-			session = dbconn.NewUnconfiguredSession(r.Context(),
+			session = dbconn.NewUnconfiguredSession(lifetime,
 				CredentialsErrFrom(r.Context()), sessionCfg, d.Log)
 			d.Log.Info("mcp session opened without credentials",
 				"requestId", RequestIDFrom(r.Context()),

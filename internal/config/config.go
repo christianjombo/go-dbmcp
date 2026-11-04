@@ -46,6 +46,10 @@ type Config struct {
 	PoolMaxConns        int32
 	PoolMaxConnIdleTime time.Duration
 	PoolMaxConnLifetime time.Duration
+	// SessionIdleTimeout reclaims a Streamable HTTP session's pool after a
+	// period with no tool calls. Those sessions have no long-lived request
+	// whose cancellation could signal teardown.
+	SessionIdleTimeout time.Duration
 
 	// MaxResultBytes caps the raw bytes accumulated from a single result set
 	// before the read stops. Row ceilings alone do not bound memory: 2000
@@ -102,6 +106,7 @@ func Load(version string) (*Config, []string) {
 		PoolMaxConns:        int32(envInt("MCP_POOL_MAX_CONNS", 4, 1, 100, w)),
 		PoolMaxConnIdleTime: envDurMS("MCP_POOL_MAX_CONN_IDLE_MS", 60_000, 1_000, 3_600_000, w),
 		PoolMaxConnLifetime: envDurMS("MCP_POOL_MAX_CONN_LIFETIME_MS", 1_800_000, 10_000, 86_400_000, w),
+		SessionIdleTimeout:  envDurMS("MCP_SESSION_IDLE_MS", 900_000, 30_000, 86_400_000, w),
 
 		MaxResultBytes: envInt("MCP_MAX_RESULT_BYTES", 32<<20, 64<<10, 1<<30, w),
 

@@ -24,6 +24,16 @@ type SessionConfig struct {
 	// PoolCloseGrace bounds how long Close waits for pgx to drain before it
 	// gives up and logs. It never blocks shutdown indefinitely.
 	PoolCloseGrace time.Duration
+	// IdleTimeout closes a session that has gone unused for this long.
+	//
+	// It exists because the two MCP transports have different lifetimes. The
+	// legacy SSE transport holds one long-lived GET, so the request context
+	// spans the whole session and cancelling it is the right teardown signal.
+	// Streamable HTTP has no such stream: initialize and every tools/call are
+	// separate POSTs, and binding the pool to any one of them would release
+	// it the instant that request finished. For those sessions the pool is
+	// detached from the request and reclaimed on inactivity instead.
+	IdleTimeout time.Duration
 }
 
 // Session owns exactly one tenant's connection pool for exactly the lifetime
@@ -52,9 +62,10 @@ type Session struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu     sync.Mutex
-	pool   Pool
-	closed bool
+	mu        sync.Mutex
+	pool      Pool
+	closed    bool
+	idleTimer *time.Timer
 }
 
 // NewSession binds a tenant's credentials to the lifetime of parent, which is
@@ -78,7 +89,26 @@ func NewSession(parent context.Context, creds *Credentials, cfg SessionConfig, l
 		s.log.Debug("stream context done; releasing database pool")
 		s.Close()
 	})
+	s.startIdleTimer()
 	return s
+}
+
+// startIdleTimer arms inactivity-based reclamation, when configured.
+func (s *Session) startIdleTimer() {
+	if s.cfg.IdleTimeout <= 0 {
+		return
+	}
+	s.idleTimer = time.AfterFunc(s.cfg.IdleTimeout, func() {
+		s.log.Info("session idle; releasing database pool", "idleTimeout", s.cfg.IdleTimeout.String())
+		s.Close()
+	})
+}
+
+// touch pushes the idle deadline out. Called on every use.
+func (s *Session) touch() {
+	if s.idleTimer != nil {
+		s.idleTimer.Reset(s.cfg.IdleTimeout)
+	}
 }
 
 // NewUnconfiguredSession represents a stream whose request carried no usable
@@ -88,6 +118,7 @@ func NewUnconfiguredSession(parent context.Context, credsErr error, cfg SessionC
 	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
 	s := &Session{credsErr: credsErr, cfg: cfg, log: log, ctx: ctx, cancel: cancel}
 	context.AfterFunc(parent, func() { s.Close() })
+	s.startIdleTimer()
 	return s
 }
 
@@ -105,6 +136,8 @@ func (s *Session) Acquire(ctx context.Context) (Pool, error) {
 		}
 		return nil, errors.New("this stream has no database credentials")
 	}
+	s.touch()
+
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -200,6 +233,9 @@ func (s *Session) Close() {
 	s.closed = true
 	pool := s.pool
 	s.pool = nil
+	if s.idleTimer != nil {
+		s.idleTimer.Stop()
+	}
 	s.mu.Unlock()
 
 	// Cancel first: pgxpool.Close waits for checked-out connections to be
